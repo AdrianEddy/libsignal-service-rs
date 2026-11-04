@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
+use http::Method;
 use libsignal_core::DeviceId;
 use libsignal_protocol::{
     kem::{Key, Public},
     IdentityKey, PreKeyBundle, PublicKey, SenderCertificate, ServiceId,
     ServiceIdKind, SignalProtocolError,
 };
-use reqwest::Method;
 use serde::Deserialize;
 
 use crate::{
@@ -134,7 +134,7 @@ impl SignalWebSocket<websocket::Identified> {
             .send_json(&req)
             .await?;
 
-        if res.status_code() == Some(reqwest::StatusCode::CONFLICT) {
+        if res.status_code() == Some(http::StatusCode::CONFLICT) {
             return Ok(false);
         }
 

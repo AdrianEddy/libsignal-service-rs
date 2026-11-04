@@ -1,3 +1,5 @@
+use std::{future::Future, rc::Rc};
+
 use bytes::{Buf, Bytes};
 
 use crate::{
@@ -6,6 +8,8 @@ use crate::{
     messagepipe::MessagePipe,
     models::{Contact, ParseContactError},
     push_service::*,
+    transport::Clock,
+    websocket::SocketEnd,
 };
 
 /// Equivalent of Java's `SignalServiceMessageReceiver`.
@@ -21,25 +25,37 @@ impl MessageReceiver {
         MessageReceiver { service }
     }
 
+    /// Opens the account's WebSocket and its message pipe. The caller runs
+    /// the socket's task (see [`SignalWebSocket::new`]).
+    ///
+    /// [`SignalWebSocket::new`]: crate::websocket::SignalWebSocket::new
     pub async fn create_message_pipe(
-        &mut self,
+        &self,
         credentials: ServiceCredentials,
         allow_stories: bool,
-    ) -> Result<MessagePipe, ServiceError> {
+        clock: Rc<dyn Clock>,
+    ) -> Result<
+        (
+            MessagePipe,
+            impl Future<Output = Result<SocketEnd, ServiceError>> + 'static,
+        ),
+        ServiceError,
+    > {
         let headers = &[(
             "X-Signal-Receive-Stories",
             if allow_stories { "true" } else { "false" },
         )];
-        let ws = self
+        let (ws, task) = self
             .service
             .ws(
                 "/v1/websocket/",
                 "/v1/keepalive",
                 headers,
                 Some(credentials),
+                clock,
             )
             .await?;
-        Ok(MessagePipe::from_socket(ws))
+        Ok((MessagePipe::from_socket(ws), task))
     }
 
     pub async fn retrieve_contacts(

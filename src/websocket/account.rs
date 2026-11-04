@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use reqwest::Method;
+use http::Method;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

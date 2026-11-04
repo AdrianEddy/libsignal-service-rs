@@ -1,18 +1,15 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::marker::PhantomData;
-use std::sync::{Arc, Mutex, MutexGuard};
-
+use std::fmt;
 use std::future::Future;
+use std::marker::PhantomData;
+use std::rc::Rc;
 
 use bytes::Bytes;
-use futures::channel::oneshot::Canceled;
 use futures::channel::{mpsc, oneshot};
-use futures::future::BoxFuture;
 use futures::prelude::*;
 use futures::stream::FuturesUnordered;
-use reqwest::Method;
-use reqwest_websocket::WebSocket;
-use tokio::time::Instant;
+use http::{HeaderMap, Method, StatusCode};
 use tracing::debug;
 
 use crate::prelude::PushService;
@@ -21,6 +18,7 @@ use crate::proto::{
     WebSocketResponseMessage,
 };
 use crate::push_service::{self, ServiceError, SignalServiceResponse};
+use crate::transport::{Clock, WsConnection, WsEvent, WsUpgrade};
 
 pub mod account;
 pub mod calling;
@@ -71,6 +69,41 @@ impl WebSocketType for Identified {}
 
 impl WebSocketType for Unidentified {}
 
+/// The close code of a client that leaves (RFC 6455 §7.4.1).
+const CLOSE_GOING_AWAY: u16 = 1001;
+
+/// Why a socket's task ended, when no error ended it (see
+/// [`SignalWebSocket::new`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SocketEnd {
+    /// The server closed the connection. The chat service closes with 4401
+    /// once the socket's credentials are no longer valid, as when the device
+    /// was removed from the account, and with 4409 when another connection
+    /// with the same credentials took over. The provisioning service closes
+    /// with 1000 "Timeout" when no device sent a provisioning message in
+    /// time, and with 1000 "Closed" once its message was answered.
+    Closed { code: u16, reason: String },
+    /// A keepalive went unanswered for a whole interval, so lss closed the
+    /// connection as going away (1001).
+    KeepaliveUnanswered,
+    /// Every handle was dropped, and no request was in flight.
+    Released,
+}
+
+impl fmt::Display for SocketEnd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closed { code, reason } => {
+                write!(f, "closed by the server with {code} {reason:?}")
+            },
+            Self::KeepaliveUnanswered => {
+                f.write_str("a keepalive went unanswered")
+            },
+            Self::Released => f.write_str("every handle was dropped"),
+        }
+    }
+}
+
 /// A dispatching web socket client for the Signal web socket API.
 ///
 /// This structure can be freely cloned, since this acts as a *facade* for multiple entry and exit
@@ -80,7 +113,7 @@ pub struct SignalWebSocket<C: WebSocketType> {
     _type: PhantomData<C>,
     // XXX: at the end of the migration, this should be CDN operations only
     pub(crate) unidentified_push_service: PushService,
-    inner: Arc<Mutex<SignalWebSocketInner>>,
+    inner: Rc<SignalWebSocketInner>,
     request_sink: mpsc::Sender<(
         WebSocketRequestMessage,
         oneshot::Sender<Result<WebSocketResponseMessage, ServiceError>>,
@@ -88,7 +121,9 @@ pub struct SignalWebSocket<C: WebSocketType> {
 }
 
 struct SignalWebSocketInner {
-    stream: Option<SignalRequestStream>,
+    stream: RefCell<Option<SignalRequestStream>>,
+    /// The headers of the response that upgraded the connection.
+    upgrade_headers: HeaderMap,
 }
 
 struct SignalWebSocketProcess {
@@ -110,11 +145,14 @@ struct SignalWebSocketProcess {
 
     outgoing_keep_alive_set: HashSet<u64>,
 
-    outgoing_responses: FuturesUnordered<
-        BoxFuture<'static, Result<WebSocketResponseMessage, Canceled>>,
-    >,
+    /// The application's responses to Signal's requests, as they complete.
+    outgoing_responses:
+        FuturesUnordered<oneshot::Receiver<WebSocketResponseMessage>>,
 
-    ws: WebSocket,
+    ws: Box<dyn WsConnection>,
+
+    /// Times the keepalive.
+    clock: Rc<dyn Clock>,
 }
 
 impl SignalWebSocketProcess {
@@ -161,7 +199,7 @@ impl SignalWebSocketProcess {
                         reason: "request handler failed",
                     },
                 )?;
-                self.outgoing_responses.push(Box::pin(recv));
+                self.outgoing_responses.push(recv);
 
                 Ok(())
             },
@@ -182,20 +220,17 @@ impl SignalWebSocketProcess {
                     } else if let Some(_x) =
                         self.outgoing_keep_alive_set.take(&id)
                     {
-                        let status = reqwest::StatusCode::from_u16(
-                            response.status() as _,
-                        )
-                        .map_err(|e| {
-                            ServiceError::IO(std::io::Error::other(format!(
-                                "invalid http status code {} - {e}",
-                                response.status()
-                            )))
-                        })?;
+                        let status =
+                            StatusCode::from_u16(response.status() as _)
+                                .map_err(|e| {
+                                    ServiceError::IO(std::io::Error::other(
+                                        format!(
+                                            "invalid http status code {} - {e}",
+                                            response.status()
+                                        ),
+                                    ))
+                                })?;
                         if !status.is_success() {
-                            tracing::warn!(
-                                %status,
-                                "response code for keep-alive not successful"
-                            );
                             return Err(ServiceError::UnhandledResponseCode {
                                 status,
                                 body: String::from_utf8_lossy(response.body())
@@ -229,24 +264,28 @@ impl SignalWebSocketProcess {
         }
     }
 
-    async fn run(mut self) -> Result<(), ServiceError> {
-        // A keepalive sent before the server registers our presence makes it close the socket.
-        let mut ka_interval = tokio::time::interval_at(
-            Instant::now() + push_service::KEEPALIVE_TIMEOUT_SECONDS,
-            push_service::KEEPALIVE_TIMEOUT_SECONDS,
-        );
+    /// Runs the socket until it ends, and returns why. The caller logs the
+    /// end; lss writes no more than a debug line.
+    async fn run(mut self) -> Result<SocketEnd, ServiceError> {
+        // A keepalive sent before the server registers our presence makes it
+        // close the socket, so the first one waits a whole interval too. Each
+        // keepalive arms the next wait: a task that stalls sends one late
+        // keepalive, not a burst.
+        let mut keep_alive = self
+            .clock
+            .sleep(push_service::KEEPALIVE_TIMEOUT_SECONDS)
+            .fuse();
 
         loop {
             futures::select! {
-                _ = ka_interval.tick().fuse() => {
+                () = keep_alive => {
                     use prost::Message;
                     if !self.outgoing_keep_alive_set.is_empty() {
-                        tracing::warn!("Websocket will be closed due to failed keepalives.");
-                        if let Err(e) = self.ws.close(reqwest_websocket::CloseCode::Away, None).await {
+                        tracing::debug!("keepalive unanswered; closing the websocket");
+                        if let Err(e) = self.ws.close(CLOSE_GOING_AWAY).await {
                             tracing::debug!("Could not close WebSocket: {:?}", e);
                         }
-                        self.outgoing_keep_alive_set.clear();
-                        break;
+                        return Ok(SocketEnd::KeepaliveUnanswered);
                     }
                     tracing::debug!("sending keep-alive");
                     let request = WebSocketRequestMessage::new(Method::GET)
@@ -260,10 +299,11 @@ impl SignalWebSocketProcess {
                         ..Default::default()
                     };
                     let buffer = msg.encode_to_vec();
-                    if let Err(e) = self.ws.send(reqwest_websocket::Message::Binary(buffer.into())).await {
-                        tracing::info!("Websocket sink has closed: {:?}.", e);
-                        break;
-                    };
+                    self.ws.send(Bytes::from(buffer)).await?;
+                    keep_alive = self
+                        .clock
+                        .sleep(push_service::KEEPALIVE_TIMEOUT_SECONDS)
+                        .fuse();
                 },
                 // Process requests from the application, forward them to Signal
                 x = self.requests.next() => {
@@ -294,33 +334,23 @@ impl SignalWebSocketProcess {
                                 ..Default::default()
                             };
                             let buffer = msg.encode_to_vec();
-                            self.ws.send(reqwest_websocket::Message::Binary(buffer.into())).await?
+                            self.ws.send(Bytes::from(buffer)).await?
                         }
                         None => {
                             debug!("end of application request stream; websocket closing");
-                            return Ok(());
+                            return Ok(SocketEnd::Released);
                         }
                     }
                 }
                 // Incoming websocket message
                 web_socket_item = self.ws.next().fuse() => {
-                    use reqwest_websocket::Message;
                     match web_socket_item {
-                        Some(Ok(Message::Close { code, reason })) => {
-                            tracing::warn!(%code, reason, "websocket closed");
-                            break;
+                        Some(Ok(WsEvent::Close { code, reason })) => {
+                            tracing::debug!(%code, reason, "websocket closed");
+                            return Ok(SocketEnd::Closed { code, reason });
                         },
-                        Some(Ok(Message::Binary(frame))) => {
+                        Some(Ok(WsEvent::Binary(frame))) => {
                             self.process_frame(frame).await?;
-                        }
-                        Some(Ok(Message::Ping(_))) => {
-                            tracing::trace!("received ping");
-                        }
-                        Some(Ok(Message::Pong(_))) => {
-                            tracing::trace!("received pong");
-                        }
-                        Some(Ok(Message::Text(_))) => {
-                            tracing::trace!("received text (unsupported, skipping)");
                         }
                         Some(Err(e)) => return Err(e.into()),
                         None => {
@@ -330,10 +360,12 @@ impl SignalWebSocketProcess {
                         }
                     }
                 }
-                response = self.outgoing_responses.next() => {
+                // The set is terminated while empty, which turns this branch off
+                // until the next push.
+                response = self.outgoing_responses.select_next_some() => {
                     use prost::Message;
                     match response {
-                        Some(Ok(response)) => {
+                        Ok(response) => {
                             tracing::trace!("sending response {:?}", response);
 
                             let msg = WebSocketMessage {
@@ -342,32 +374,61 @@ impl SignalWebSocketProcess {
                                 ..Default::default()
                             };
                             let buffer = msg.encode_to_vec();
-                            self.ws.send(buffer.into()).await?;
+                            self.ws.send(Bytes::from(buffer)).await?;
                         }
-                        Some(Err(error)) => {
+                        Err(error) => {
                             tracing::error!(%error, "could not generate response to a Signal request; responder was canceled. continuing.");
-                        }
-                        None => {
-                            unreachable!("outgoing responses should never fuse")
                         }
                     }
                 }
             }
         }
-        Ok(())
     }
 }
 
 impl<C: WebSocketType> SignalWebSocket<C> {
-    fn inner_locked(&self) -> MutexGuard<'_, SignalWebSocketInner> {
-        self.inner.lock().unwrap()
-    }
-
+    /// The handle of the socket `upgrade` opened, and the socket's task.
+    ///
+    /// The task runs the socket: it sends a keepalive every
+    /// [`KEEPALIVE_TIMEOUT_SECONDS`](push_service::KEEPALIVE_TIMEOUT_SECONDS)
+    /// on `clock`, matches responses to requests and passes Signal's requests
+    /// to the request stream. lss spawns nothing: the caller runs the task, and
+    /// the socket does nothing until it does.
+    ///
+    /// The task resolves to why the socket ended, which the caller logs. It
+    /// ends with:
+    /// - [`SocketEnd::Closed`] when the server closes the connection;
+    /// - [`SocketEnd::KeepaliveUnanswered`] when a keepalive goes unanswered
+    ///   for a whole interval, after closing the connection with 1001;
+    /// - [`SocketEnd::Released`] once every handle is dropped and no request
+    ///   is in flight;
+    /// - [`ServiceError::Transport`] when the connection breaks or a send on it
+    ///   fails;
+    /// - [`ServiceError::WsClosing`] when the connection ends without the
+    ///   server's close, or when Signal sends a request after the request
+    ///   stream was dropped, as when a
+    ///   [`MessagePipe`](crate::messagepipe::MessagePipe)'s stream is dropped
+    ///   while handles live;
+    /// - [`ServiceError::ProtobufDecodeError`] for a frame lss cannot decode,
+    ///   and [`ServiceError::InvalidFrame`] for one of an unknown type or
+    ///   without the request or response its type names;
+    /// - [`ServiceError::UnhandledResponseCode`] when a keepalive is answered
+    ///   with a status outside 2xx, or [`ServiceError::IO`] when that status
+    ///   is not a valid HTTP status.
+    ///
+    /// However the task ends, and if it is dropped, the connection closes and
+    /// requests still waiting fail with [`ServiceError::WsClosing`].
     pub fn new(
-        ws: WebSocket,
+        upgrade: WsUpgrade,
         keep_alive_path: String,
         unidentified_push_service: PushService,
-    ) -> (Self, impl Future<Output = ()>) {
+        clock: Rc<dyn Clock>,
+    ) -> (Self, impl Future<Output = Result<SocketEnd, ServiceError>>) {
+        let WsUpgrade {
+            headers: upgrade_headers,
+            connection,
+        } = upgrade;
+
         // Create process
         let (incoming_request_sink, incoming_request_stream) =
             mpsc::unbounded();
@@ -379,35 +440,31 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             request_sink: incoming_request_sink,
             outgoing_requests: HashMap::default(),
             outgoing_keep_alive_set: HashSet::new(),
-            // Initializing the FuturesUnordered with a `pending` future means it will never fuse
-            // itself, so an "empty" FuturesUnordered will still allow new futures to be added.
-            outgoing_responses: vec![
-                Box::pin(futures::future::pending()) as BoxFuture<_>
-            ]
-            .into_iter()
-            .collect(),
-            ws,
+            outgoing_responses: FuturesUnordered::new(),
+            ws: connection,
+            clock,
         };
-        let process = process.run().map(|x| match x {
-            Ok(()) => (),
-            Err(e) => {
-                tracing::error!("SignalWebSocket: {}", e);
-            },
-        });
 
         (
             Self {
                 _type: PhantomData,
                 request_sink: outgoing_request_sink,
                 unidentified_push_service,
-                inner: Arc::new(Mutex::new(SignalWebSocketInner {
-                    stream: Some(SignalRequestStream {
+                inner: Rc::new(SignalWebSocketInner {
+                    stream: RefCell::new(Some(SignalRequestStream {
                         inner: incoming_request_stream,
-                    }),
-                })),
+                    })),
+                    upgrade_headers,
+                }),
             },
-            process,
+            process.run(),
         )
+    }
+
+    /// The headers of the response that upgraded the connection, such as
+    /// `X-Signal-Alert`.
+    pub fn upgrade_headers(&self) -> &HeaderMap {
+        &self.inner.upgrade_headers
     }
 
     pub fn is_closed(&self) -> bool {
@@ -415,17 +472,17 @@ impl<C: WebSocketType> SignalWebSocket<C> {
     }
 
     pub fn is_used(&self) -> bool {
-        self.inner_locked().stream.is_none()
+        self.inner.stream.borrow().is_none()
     }
 
     pub(crate) fn take_request_stream(
         &mut self,
     ) -> Option<SignalRequestStream> {
-        self.inner_locked().stream.take()
+        self.inner.stream.borrow_mut().take()
     }
 
     pub(crate) fn return_request_stream(&mut self, r: SignalRequestStream) {
-        self.inner_locked().stream.replace(r);
+        self.inner.stream.borrow_mut().replace(r);
     }
 
     // XXX Ideally, this should take an *async* closure, then we could get rid of the
@@ -438,12 +495,13 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         f: F,
     ) -> R {
         let mut s = self
-            .inner_locked()
+            .inner
             .stream
+            .borrow_mut()
             .take()
             .expect("request stream invariant");
         let r = f(&mut s);
-        self.inner_locked().stream.replace(s);
+        self.inner.stream.borrow_mut().replace(s);
         r
     }
 
@@ -481,9 +539,8 @@ impl<C: WebSocketType> SignalWebSocket<C> {
     ) -> Result<T, ServiceError>
     where
         for<'de> T: serde::Deserialize<'de>,
-        F: FnOnce(WebSocketResponseMessage) -> Fut + Send,
-        Fut: Future<Output = Result<WebSocketResponseMessage, ServiceError>>
-            + Send,
+        F: FnOnce(WebSocketResponseMessage) -> Fut,
+        Fut: Future<Output = Result<WebSocketResponseMessage, ServiceError>>,
     {
         self.request(r)
             .await?

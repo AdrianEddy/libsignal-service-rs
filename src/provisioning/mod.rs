@@ -3,12 +3,15 @@ mod pipe;
 
 use std::array::TryFromSliceError;
 use std::convert::TryInto;
+use std::pin::pin;
+use std::rc::Rc;
 
 use libsignal_account_keys::{AccountEntropyPool, InvalidAccountEntropyPool};
 
 pub use cipher::ProvisioningCipher;
 
 use base64::Engine;
+use futures::future::{self, Either};
 use futures::StreamExt;
 use futures::{channel::mpsc::Sender, pin_mut, SinkExt};
 use libsignal_core::curve::CurveError;
@@ -36,6 +39,7 @@ use crate::{
     pre_keys::PreKeysStore,
     push_service::{HttpAuth, PushService, ServiceIds},
     transport::Clock,
+    websocket::{self, SignalWebSocket, SocketEnd},
 };
 
 pub use crate::proto::{
@@ -89,6 +93,12 @@ pub enum ProvisioningError {
     WsError { reason: String },
     #[error("Websocket closing")]
     WsClosing,
+    /// The provisioning socket ended before the steps that need it were done:
+    /// the server closed it, with 1000 "Timeout" when no device sent a
+    /// provisioning message in time, or a keepalive went unanswered. A socket
+    /// that failed is a [`ServiceError`](Self::ServiceError).
+    #[error("provisioning socket ended: {0}")]
+    SocketEnded(SocketEnd),
     #[error("Service error: {0}")]
     ServiceError(#[from] ServiceError),
     #[error("libsignal-protocol error: {0}")]
@@ -171,6 +181,12 @@ pub struct NewDeviceRegistration {
     pub ephemeral_backup_key: Option<[u8; 32]>,
 }
 
+/// Links this device to an account: opens the provisioning socket, sends its
+/// link to `tx`, waits for the primary device's provisioning message and
+/// registers the device. The socket's task runs beside these steps, timed by
+/// `clock`, and ends with them. If the socket ends before the steps that need
+/// it, the error is why it ended: [`ProvisioningError::SocketEnded`], or the
+/// socket's failure as a [`ProvisioningError::ServiceError`].
 #[allow(clippy::too_many_arguments)]
 pub async fn link_device<
     R: rand::Rng + rand::CryptoRng,
@@ -180,22 +196,72 @@ pub async fn link_device<
     aci_store: &mut Aci,
     pni_store: &mut Pni,
     csprng: &mut R,
+    clock: Rc<dyn Clock>,
+    push_service: PushService,
+    password: &str,
+    device_name: &str,
+    tx: Sender<SecondaryDeviceProvisioning>,
+) -> Result<(), ProvisioningError> {
+    // open a websocket without authentication, to receive a tsurl://
+    let (ws, socket) = push_service
+        .ws(
+            "/v1/websocket/provisioning/",
+            "/v1/keepalive/provisioning",
+            &[],
+            None,
+            clock.clone(),
+        )
+        .await?;
+
+    // If the socket ends first, its request stream ends, and so do the steps
+    // waiting on it, which then report why the socket ended; a step that
+    // doesn't wait on it, such as the final HTTP request, still runs to its
+    // end.
+    let steps = pin!(link_steps(
+        ws,
+        aci_store,
+        pni_store,
+        csprng,
+        &*clock,
+        push_service,
+        password,
+        device_name,
+        tx,
+    ));
+    match future::select(pin!(socket), steps).await {
+        Either::Left((end, steps)) => match steps.await {
+            // What a step sees once the socket under it has ended: no more
+            // requests, or no way to answer one.
+            Err(
+                ProvisioningError::MissingUrl
+                | ProvisioningError::MissingMessage
+                | ProvisioningError::WsClosing,
+            ) => Err(match end {
+                Ok(end) => ProvisioningError::SocketEnded(end),
+                Err(e) => ProvisioningError::ServiceError(e),
+            }),
+            result => result,
+        },
+        Either::Right((result, _socket)) => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn link_steps<
+    R: rand::Rng + rand::CryptoRng,
+    Aci: PreKeysStore,
+    Pni: PreKeysStore,
+>(
+    ws: SignalWebSocket<websocket::Unidentified>,
+    aci_store: &mut Aci,
+    pni_store: &mut Pni,
+    csprng: &mut R,
     clock: &dyn Clock,
     mut push_service: PushService,
     password: &str,
     device_name: &str,
     mut tx: Sender<SecondaryDeviceProvisioning>,
 ) -> Result<(), ProvisioningError> {
-    // open a websocket without authentication, to receive a tsurl://
-    let ws = push_service
-        .ws(
-            "/v1/websocket/provisioning/",
-            "/v1/keepalive/provisioning",
-            &[],
-            None,
-        )
-        .await?;
-
     let registration_id = csprng.random_range(1..256);
     let pni_registration_id = csprng.random_range(1..256);
 

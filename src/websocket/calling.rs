@@ -1,4 +1,4 @@
-use reqwest::Method;
+use http::Method;
 use serde::Deserialize;
 
 use crate::{

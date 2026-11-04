@@ -1,5 +1,5 @@
+use http::Method;
 use libsignal_protocol::Aci;
-use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use zkgroup::profiles::{ProfileKeyCommitment, ProfileKeyVersion};
 
@@ -130,7 +130,7 @@ impl SignalWebSocket<websocket::Identified> {
         avatar: AvatarWrite<&mut C>,
     ) -> Result<Option<String>, ServiceError>
     where
-        C: std::io::Read + Send + 's,
+        C: std::io::Read + 's,
         S: AsRef<str>,
     {
         // Bincode is transparent and will return a hex-encoded string.

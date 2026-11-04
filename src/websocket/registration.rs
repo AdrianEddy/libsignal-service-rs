@@ -1,6 +1,6 @@
+use http::Method;
 use libsignal_protocol::IdentityKeyStore;
 use rand::{CryptoRng, Rng};
-use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 use uuid::Uuid;

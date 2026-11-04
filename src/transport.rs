@@ -1,11 +1,12 @@
 //! The seams through which lss reaches the network and the clock.
 //!
-//! lss sends every HTTP request through a [`Transport`] the application
-//! provides, and reads the time from a [`Clock`] the application passes in.
-//! The transport owns connections, TLS and each service's trust roots,
-//! proxies, framing, timeouts and the `User-Agent`; a request the server
-//! holds sets its own wait for the response head
-//! ([`HttpRequest::timeout`]).
+//! lss sends every HTTP request and opens every WebSocket through a
+//! [`Transport`] the application provides, and reads the time and waits on
+//! timers through a [`Clock`] the application passes in. The transport owns
+//! connections, TLS and each service's trust roots, proxies, framing,
+//! timeouts and the `User-Agent`; a request the server holds sets its own wait
+//! for the response head ([`HttpRequest::timeout`]). lss spawns no task: a
+//! socket's task is returned to the caller, who runs it.
 
 use std::{
     error::Error,
@@ -14,7 +15,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{future::LocalBoxFuture, stream::LocalBoxStream};
+use futures::{future::LocalBoxFuture, stream::LocalBoxStream, Stream};
 use http::{HeaderMap, Method, StatusCode};
 use url::{Position, Url};
 
@@ -139,8 +140,11 @@ impl fmt::Debug for HttpResponse {
 }
 
 /// A WebSocket handshake to a `wss://` URL.
-#[derive(Debug)]
+///
+/// `Debug` leaves out what can carry a credential, as [`HttpRequest`]'s does.
+#[derive(derive_more::Debug)]
 pub struct WsConnect {
+    #[debug("{}", RedactedUrl(url))]
     pub url: Url,
     pub headers: HeaderMap,
 }
@@ -151,22 +155,21 @@ pub struct WsUpgrade {
     pub connection: Box<dyn WsConnection>,
 }
 
-/// One open WebSocket. Only binary frames and the peer's close reach lss;
-/// the transport answers pings.
-pub trait WsConnection {
+/// One open WebSocket. Only binary frames and the peer's Close reach lss;
+/// the transport answers pings and the peer's Close. The stream yields
+/// `None` once the connection has ended. Dropping it closes the connection.
+pub trait WsConnection:
+    Stream<Item = Result<WsEvent, TransportError>> + Unpin
+{
     /// Sends one binary frame.
     fn send(
         &mut self,
         frame: Bytes,
     ) -> LocalBoxFuture<'_, Result<(), TransportError>>;
 
-    /// The next event, or `None` once the connection has ended. Dropping the
-    /// future before it resolves loses no frame.
-    fn next(
-        &mut self,
-    ) -> LocalBoxFuture<'_, Option<Result<WsEvent, TransportError>>>;
-
-    /// Closes the connection with `code`.
+    /// Sends a Close frame with `code` (RFC 6455 §5.5.1). Resolves once the
+    /// frame is handed to the connection, or that fails, and never waits for
+    /// the peer's Close: lss drops the connection next.
     fn close(
         &mut self,
         code: u16,
@@ -286,7 +289,11 @@ impl From<TransportError> for io::Error {
 }
 
 /// The time, for the timestamps lss writes and its checks of session and
-/// prekey age.
+/// prekey age, and the timer of a WebSocket's keepalive.
 pub trait Clock {
     fn now(&self) -> SystemTime;
+
+    /// Resolves once `duration` has passed. Dropping the future cancels the
+    /// wait.
+    fn sleep(&self, duration: Duration) -> LocalBoxFuture<'static, ()>;
 }

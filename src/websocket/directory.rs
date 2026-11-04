@@ -2,6 +2,7 @@
 //!
 //! Provides authentication credentials for CDSI contact lookup operations.
 //!
+use http::Method;
 use libsignal_core::ServiceId;
 use libsignal_net::auth::Auth;
 use libsignal_net::cdsi::{CdsiConnection, LookupResponseEntry};
@@ -10,7 +11,6 @@ use libsignal_net::connect_state::{
 };
 use libsignal_net_infra::dns::DnsResolver;
 use libsignal_net_infra::utils::no_network_change_events;
-use reqwest::Method;
 use serde::Deserialize;
 use tracing::warn;
 

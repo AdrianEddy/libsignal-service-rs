@@ -41,9 +41,6 @@ pub use crate::account_manager::{
 pub use crate::service_address::*;
 pub use crate::storage_service::{StorageService, StorageServiceError};
 
-pub const USER_AGENT: &str =
-    concat!(env!("CARGO_PKG_NAME"), "-rs-", env!("CARGO_PKG_VERSION"));
-
 /// GROUP_UPDATE_FLAG signals that this message updates the group membership or
 /// name.
 pub const GROUP_UPDATE_FLAG: u32 = 1;

@@ -21,9 +21,6 @@ pub struct ServiceConfiguration {
     service_url: Url,
     storage_url: Url,
     cdn_urls: HashMap<u32, Url>,
-    /// The root the WebSocket's own TLS trusts. Empty in a configuration from
-    /// [`ServiceConfiguration::new`]; HTTP trust is the transport's.
-    pub certificate_authority: String,
     pub unidentified_sender_trust_roots: Vec<PublicKey>,
     pub zkgroup_server_public_params: ServerPublicParams,
 }
@@ -38,9 +35,8 @@ pub struct ServiceUrls {
 }
 
 impl ServiceConfiguration {
-    /// An environment at `urls`, for a [`Transport`] that supplies TLS trust
-    /// itself: [`certificate_authority`](Self::certificate_authority) stays
-    /// empty.
+    /// An environment at `urls`. Which roots its TLS trusts is the
+    /// [`Transport`]'s choice.
     ///
     /// [`Transport`]: crate::transport::Transport
     pub fn new(
@@ -52,7 +48,6 @@ impl ServiceConfiguration {
             service_url: urls.chat,
             storage_url: urls.storage,
             cdn_urls: urls.cdn,
-            certificate_authority: String::new(),
             unidentified_sender_trust_roots,
             zkgroup_server_public_params,
         }
@@ -272,7 +267,6 @@ impl From<&SignalServers> for ServiceConfiguration {
                     map.insert(3, "https://cdn3-staging.signal.org".parse().unwrap());
                     map
                 },
-                certificate_authority: include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/certs/staging-root-ca.pem")).to_string(),
                 unidentified_sender_trust_roots: vec![
                     PublicKey::deserialize(&BASE64_RELAXED.decode("BbqY1DzohE4NUZoVF+L18oUPrK3kILllLEJh2UnPSsEx").unwrap()).unwrap(),
                     PublicKey::deserialize(&BASE64_RELAXED.decode("BYhU6tPjqP46KGZEzRs1OL4U39V5dlPJ/X09ha4rErkm").unwrap()).unwrap(),
@@ -292,7 +286,6 @@ impl From<&SignalServers> for ServiceConfiguration {
                     map.insert(3, "https://cdn3.signal.org".parse().unwrap());
                     map
                 },
-                certificate_authority: include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/certs/production-root-ca.pem")).to_string(),
                 unidentified_sender_trust_roots: vec![
                     PublicKey::deserialize(&BASE64_RELAXED.decode("BXu6QIKVz5MA8gstzfOgRQGqyLqOwNKHL6INkv3IHWMF").unwrap()).unwrap(),
                     PublicKey::deserialize(&BASE64_RELAXED.decode("BUkY0I+9+oPgDCn4+Ac6Iu813yvqkDr/ga8DzLxFxuk6").unwrap()).unwrap(),

@@ -1,16 +1,27 @@
-//! lss's HTTP requests and their outcomes, seen through an in-memory
-//! [`Transport`].
+//! lss's HTTP requests and WebSockets and their outcomes, seen through an
+//! in-memory [`Transport`].
 
 use std::{
-    cell::RefCell, collections::HashMap, collections::VecDeque, error::Error,
-    fmt, io, rc::Rc, time::Duration,
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    collections::VecDeque,
+    error::Error,
+    fmt, io,
+    pin::{pin, Pin},
+    rc::Rc,
+    task::{Context, Poll},
+    time::{Duration, SystemTime},
 };
 
 use base64::prelude::*;
 use bytes::Bytes;
 use futures::{
-    future::LocalBoxFuture, stream, AsyncReadExt as _, StreamExt as _,
-    TryStreamExt as _,
+    channel::{mpsc, oneshot},
+    executor::LocalPool,
+    future::{self, FutureExt as _, LocalBoxFuture},
+    poll, stream,
+    task::LocalSpawnExt as _,
+    AsyncReadExt as _, Stream, StreamExt as _, TryStreamExt as _,
 };
 use http::{header, HeaderMap, Method, StatusCode};
 use libsignal_service::{
@@ -18,8 +29,13 @@ use libsignal_service::{
         Endpoint, ServiceConfiguration, ServiceCredentials, ServiceUrls,
     },
     master_key::StorageServiceKey,
+    messagepipe::Incoming,
     prelude::{AttachmentIdentifier, AttachmentPointer, ProtobufMessage},
-    proto::{ManifestRecord, ReadOperation, StorageItems, StorageRecord},
+    proto::{
+        web_socket_message, Envelope, ManifestRecord, ReadOperation,
+        StorageItems, StorageRecord, WebSocketMessage, WebSocketRequestMessage,
+        WebSocketResponseMessage,
+    },
     protocol::{DeviceId, KeyPair},
     provisioning::ProvisioningError,
     push_service::{
@@ -29,12 +45,17 @@ use libsignal_service::{
         AttachmentV2UploadAttributes, HttpAuth, HttpAuthOverride, PushService,
         ServiceError, ERROR_BODY_LIMIT,
     },
+    receiver::MessageReceiver,
     sender::{AttachmentUploadError, MessageSenderError},
     transport::{
-        EndpointKind, HttpBody, HttpRequest, HttpResponse, Transport,
-        TransportError, TransportErrorKind, WsConnect, WsUpgrade,
+        Clock, EndpointKind, HttpBody, HttpRequest, HttpResponse, Transport,
+        TransportError, TransportErrorKind, WsConnect, WsConnection, WsEvent,
+        WsUpgrade,
     },
-    websocket::registration::DeviceActivationRequest,
+    websocket::{
+        registration::DeviceActivationRequest, Identified, SocketEnd,
+        Unidentified,
+    },
     zkgroup::ServerSecretParams,
     ProfileManagerError, StorageService, StorageServiceError,
 };
@@ -118,11 +139,35 @@ impl Error for FakeNetError {}
 struct MemoryTransport {
     seen: RefCell<Vec<Seen>>,
     answers: RefCell<VecDeque<Answer>>,
+    connects: RefCell<Vec<WsConnect>>,
+    sockets: RefCell<VecDeque<Result<WsUpgrade, TransportErrorKind>>>,
 }
 
 impl MemoryTransport {
     fn answer(&self, answer: Answer) {
         self.answers.borrow_mut().push_back(answer);
+    }
+
+    /// Opens a socket at the next handshake, with these upgrade headers, and
+    /// returns the server's end of it.
+    fn accept_socket(
+        &self,
+        upgrade_headers: &[(&'static str, &'static str)],
+    ) -> FakeServer {
+        let (upgrade, server) = socket(upgrade_headers);
+        self.sockets.borrow_mut().push_back(Ok(upgrade));
+        server
+    }
+
+    /// Fails the next handshake.
+    fn refuse_socket(&self, kind: TransportErrorKind) {
+        self.sockets.borrow_mut().push_back(Err(kind));
+    }
+
+    fn take_connect(&self) -> WsConnect {
+        let mut connects = std::mem::take(&mut *self.connects.borrow_mut());
+        assert_eq!(connects.len(), 1, "exactly one handshake");
+        connects.pop().unwrap()
     }
 
     fn take_seen(&self) -> Vec<Seen> {
@@ -201,9 +246,14 @@ impl Transport for MemoryTransport {
 
     fn websocket(
         &self,
-        _: WsConnect,
+        request: WsConnect,
     ) -> LocalBoxFuture<'_, Result<WsUpgrade, TransportError>> {
-        unreachable!("these tests make HTTP requests only")
+        self.connects.borrow_mut().push(request);
+        let socket = self.sockets.borrow_mut().pop_front().expect("a socket");
+        future::ready(
+            socket.map_err(|kind| TransportError::new(kind, FakeNetError)),
+        )
+        .boxed_local()
     }
 }
 
@@ -224,17 +274,21 @@ fn environment() -> ServiceConfiguration {
     )
 }
 
-fn push_service() -> (PushService, Rc<MemoryTransport>) {
-    let transport = Rc::new(MemoryTransport::default());
-    let credentials = ServiceCredentials {
+/// The account's credentials: device 2 of `ACI`.
+fn credentials() -> ServiceCredentials {
+    ServiceCredentials {
         aci: Some(ACI),
         pni: None,
         phonenumber: "+15550100".parse().unwrap(),
         password: Some("hunter2".into()),
         device_id: Some(DeviceId::new(2).unwrap()),
-    };
+    }
+}
+
+fn push_service() -> (PushService, Rc<MemoryTransport>) {
+    let transport = Rc::new(MemoryTransport::default());
     let service =
-        PushService::new(environment(), Some(credentials), transport.clone());
+        PushService::new(environment(), Some(credentials()), transport.clone());
     (service, transport)
 }
 
@@ -621,6 +675,29 @@ async fn errors_carry_no_reqwest_type() {
         .and_then(|inner| inner.downcast_ref::<TransportError>())
         .is_some_and(|inner| inner.kind() == TransportErrorKind::Timeout));
     assert_eq!(buf, b"part");
+
+    // A refused WebSocket upgrade keeps its status, which tells a removed
+    // device (403) apart, and the transport's error.
+    transport
+        .refuse_socket(TransportErrorKind::Rejected(StatusCode::FORBIDDEN));
+    let error = service
+        .ws::<Identified>(
+            "/v1/websocket/",
+            "/v1/keepalive",
+            &[],
+            Some(credentials()),
+            Rc::new(ManualClock::default()),
+        )
+        .await
+        .err()
+        .expect("a refused upgrade");
+    assert!(
+        matches!(&error, ServiceError::Transport(e)
+            if e.kind() == TransportErrorKind::Rejected(StatusCode::FORBIDDEN)
+                && e.get_ref().is_some_and(|source| source.is::<FakeNetError>())),
+        "{error:?}"
+    );
+    transport.take_connect();
 }
 
 #[tokio::test]
@@ -734,6 +811,21 @@ async fn invalid_header_fails_without_a_request() {
     assert_eq!(error.to_string(), "invalid HTTP header");
     assert!(error.source().is_some());
     assert!(transport.take_seen().is_empty());
+
+    // A WebSocket's header the same, before any handshake.
+    let error = service
+        .ws::<Unidentified>(
+            "/v1/websocket/",
+            "/v1/keepalive",
+            &[("X-Signal-Agent", "line\nbreak")],
+            None,
+            Rc::new(ManualClock::default()),
+        )
+        .await
+        .err()
+        .expect("an invalid header");
+    assert!(matches!(error, ServiceError::InvalidHeader(_)), "{error:?}");
+    assert!(transport.connects.borrow().is_empty());
 }
 
 #[test]
@@ -759,4 +851,614 @@ fn an_upload_location_is_logged_without_its_credential() {
         format!("{resumable:?}"),
         "Cdn { cdn_id: 2, path: \"/upload/abc\", .. }"
     );
+}
+
+// WebSockets.
+
+const KEEPALIVE: Duration = Duration::from_secs(55);
+
+/// What lss did on a socket.
+#[derive(Debug, PartialEq)]
+#[expect(clippy::large_enum_variant, reason = "a test's log")]
+enum Sent {
+    Frame(WebSocketMessage),
+    Close(u16),
+}
+
+/// lss's end of an in-memory WebSocket. It holds an `Rc`, so it is `!Send`,
+/// as a connection on the lane may be.
+struct FakeConnection {
+    sent: mpsc::UnboundedSender<Sent>,
+    events: mpsc::UnboundedReceiver<Result<WsEvent, TransportErrorKind>>,
+    open: Rc<Cell<bool>>,
+    /// Set, every send fails with it.
+    send_error: Rc<Cell<Option<TransportErrorKind>>>,
+}
+
+impl Stream for FakeConnection {
+    type Item = Result<WsEvent, TransportError>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        self.events
+            .poll_next_unpin(cx)
+            .map_err(|kind| TransportError::new(kind, FakeNetError))
+    }
+}
+
+impl WsConnection for FakeConnection {
+    fn send(
+        &mut self,
+        frame: Bytes,
+    ) -> LocalBoxFuture<'_, Result<(), TransportError>> {
+        if let Some(kind) = self.send_error.get() {
+            return future::err(TransportError::new(kind, FakeNetError))
+                .boxed_local();
+        }
+        let message = WebSocketMessage::decode(frame).expect("a message");
+        self.sent.unbounded_send(Sent::Frame(message)).unwrap();
+        future::ok(()).boxed_local()
+    }
+
+    fn close(
+        &mut self,
+        code: u16,
+    ) -> LocalBoxFuture<'_, Result<(), TransportError>> {
+        self.sent.unbounded_send(Sent::Close(code)).unwrap();
+        future::ok(()).boxed_local()
+    }
+}
+
+impl Drop for FakeConnection {
+    fn drop(&mut self) {
+        self.open.set(false);
+    }
+}
+
+/// Doesn't compile for a `Send` type: both impls would then apply, and the
+/// `_` in `<T as AmbiguousIfSend<_>>` would be ambiguous.
+trait AmbiguousIfSend<A> {
+    fn some_item() {}
+}
+impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+
+/// The server's end of an in-memory WebSocket.
+struct FakeServer {
+    sent: mpsc::UnboundedReceiver<Sent>,
+    events: mpsc::UnboundedSender<Result<WsEvent, TransportErrorKind>>,
+    open: Rc<Cell<bool>>,
+    send_error: Rc<Cell<Option<TransportErrorKind>>>,
+}
+
+impl FakeServer {
+    /// What lss sent since the last call.
+    fn take_sent(&mut self) -> Vec<Sent> {
+        std::iter::from_fn(|| self.sent.try_recv().ok()).collect()
+    }
+
+    /// The requests lss sent since the last call, which sent nothing else.
+    fn take_requests(&mut self) -> Vec<WebSocketRequestMessage> {
+        self.take_sent().into_iter().map(sent_request).collect()
+    }
+
+    /// The next thing lss sends.
+    async fn next_sent(&mut self) -> Sent {
+        self.sent.next().await.expect("the connection is open")
+    }
+
+    /// Whether lss still holds its end.
+    fn is_open(&self) -> bool {
+        self.open.get()
+    }
+
+    fn event(&self, event: Result<WsEvent, TransportErrorKind>) {
+        self.events.unbounded_send(event).unwrap();
+    }
+
+    /// Fails every later send on lss's end with `kind`.
+    fn fail_sends(&self, kind: TransportErrorKind) {
+        self.send_error.set(Some(kind));
+    }
+
+    fn frame(&self, message: WebSocketMessage) {
+        self.event(Ok(WsEvent::Binary(message.encode_to_vec().into())));
+    }
+
+    /// Answers lss's request `id`.
+    fn respond(&self, id: u64, status: u32, body: &[u8]) {
+        self.frame(WebSocketMessage {
+            r#type: Some(web_socket_message::Type::Response.into()),
+            response: Some(WebSocketResponseMessage {
+                id: Some(id),
+                status: Some(status),
+                message: Some("OK".into()),
+                headers: Vec::new(),
+                body: Some(body.to_vec()),
+            }),
+            ..Default::default()
+        });
+    }
+
+    /// Sends lss a request of the server's.
+    fn request(&self, id: u64, verb: &str, path: &str, body: Vec<u8>) {
+        self.frame(WebSocketMessage {
+            r#type: Some(web_socket_message::Type::Request.into()),
+            request: Some(WebSocketRequestMessage {
+                id: Some(id),
+                verb: Some(verb.into()),
+                path: Some(path.into()),
+                body: Some(body),
+                headers: Vec::new(),
+            }),
+            ..Default::default()
+        });
+    }
+}
+
+/// The request in what lss sent.
+fn sent_request(sent: Sent) -> WebSocketRequestMessage {
+    match sent {
+        Sent::Frame(WebSocketMessage {
+            r#type: Some(kind),
+            request: Some(request),
+            response: None,
+        }) if kind == web_socket_message::Type::Request as i32 => request,
+        other => panic!("not a request: {other:?}"),
+    }
+}
+
+fn socket(
+    upgrade_headers: &[(&'static str, &'static str)],
+) -> (WsUpgrade, FakeServer) {
+    let (sent_tx, sent) = mpsc::unbounded();
+    let (events, events_rx) = mpsc::unbounded();
+    let open = Rc::new(Cell::new(true));
+    let send_error = Rc::new(Cell::new(None));
+    let connection = FakeConnection {
+        sent: sent_tx,
+        events: events_rx,
+        open: open.clone(),
+        send_error: send_error.clone(),
+    };
+    let upgrade = WsUpgrade {
+        headers: upgrade_headers
+            .iter()
+            .map(|&(name, value)| {
+                (
+                    header::HeaderName::from_static(name),
+                    header::HeaderValue::from_static(value),
+                )
+            })
+            .collect(),
+        connection: Box::new(connection),
+    };
+    (
+        upgrade,
+        FakeServer {
+            sent,
+            events,
+            open,
+            send_error,
+        },
+    )
+}
+
+/// A clock the test moves by hand. A wait ends once the clock reaches its
+/// deadline, so a zero wait ends at once; a dropped clock ends none.
+#[derive(Default)]
+struct ManualClock(RefCell<ManualClockState>);
+
+#[derive(Default)]
+struct ManualClockState {
+    elapsed: Duration,
+    waits: Vec<(Duration, oneshot::Sender<()>)>,
+    /// Every wait asked for, in order.
+    asked: Vec<Duration>,
+}
+
+impl Clock for ManualClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::UNIX_EPOCH
+            + Duration::from_secs(1_700_000_000)
+            + self.0.borrow().elapsed
+    }
+
+    fn sleep(&self, duration: Duration) -> LocalBoxFuture<'static, ()> {
+        let mut state = self.0.borrow_mut();
+        state.asked.push(duration);
+        if duration.is_zero() {
+            return future::ready(()).boxed_local();
+        }
+        let (wake, woken) = oneshot::channel();
+        let deadline = state.elapsed + duration;
+        state.waits.push((deadline, wake));
+        async move {
+            if woken.await.is_err() {
+                future::pending::<()>().await;
+            }
+        }
+        .boxed_local()
+    }
+}
+
+impl ManualClock {
+    fn advance(&self, by: Duration) {
+        let due: Vec<_> = {
+            let mut state = self.0.borrow_mut();
+            state.elapsed += by;
+            let now = state.elapsed;
+            let (due, waiting) = std::mem::take(&mut state.waits)
+                .into_iter()
+                .partition(|(deadline, _)| *deadline <= now);
+            state.waits = waiting;
+            due
+        };
+        for (_, wake) in due {
+            let _ = wake.send(());
+        }
+    }
+
+    fn asked(&self) -> Vec<Duration> {
+        self.0.borrow().asked.clone()
+    }
+}
+
+fn get(path: &str) -> WebSocketRequestMessage {
+    WebSocketRequestMessage::new(Method::GET).path(path).build()
+}
+
+/// The keepalive on the test clock, responses matched to requests, and
+/// Signal's requests through the message pipe, which answers them.
+#[test]
+fn websocket_keepalive_and_responses() {
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+    let (service, transport) = push_service();
+    let clock = Rc::new(ManualClock::default());
+    let mut server =
+        transport.accept_socket(&[("x-signal-alert", "idle-primary-device")]);
+
+    let (pipe, task) = pool
+        .run_until(MessageReceiver::new(service).create_message_pipe(
+            credentials(),
+            true,
+            clock.clone(),
+        ))
+        .unwrap();
+
+    // The handshake: the chat service's socket, the account's credentials
+    // marked sensitive, and the caller's header. The User-Agent is the
+    // transport's.
+    let connect = transport.take_connect();
+    assert_eq!(connect.url.as_str(), "wss://chat.test/v1/websocket/");
+    assert_eq!(
+        connect.headers[header::AUTHORIZATION],
+        *basic(&format!("{ACI}.2:hunter2"))
+    );
+    assert!(connect.headers[header::AUTHORIZATION].is_sensitive());
+    assert_eq!(connect.headers["x-signal-receive-stories"], "true");
+    assert_eq!(connect.headers.len(), 2);
+    // Its `Debug`, for a log line, leaves the credential out.
+    let logged = format!("{connect:?}");
+    assert!(logged.contains("Sensitive"), "{logged}");
+    assert!(
+        !logged.contains(&BASE64_STANDARD.encode(format!("{ACI}.2:hunter2")))
+    );
+    let ws = pipe.ws();
+    assert_eq!(
+        ws.upgrade_headers()["x-signal-alert"],
+        "idle-primary-device"
+    );
+
+    let running = spawner.spawn_local_with_handle(task).unwrap();
+    pool.run_until_stalled();
+
+    // The first keepalive waits a whole interval, and each arms the next
+    // wait.
+    assert_eq!(clock.asked(), [KEEPALIVE]);
+    clock.advance(KEEPALIVE - Duration::from_secs(1));
+    pool.run_until_stalled();
+    assert_eq!(server.take_sent(), []);
+    clock.advance(Duration::from_secs(1));
+    pool.run_until_stalled();
+    let [keepalive] = &server.take_requests()[..] else {
+        panic!("one keepalive")
+    };
+    assert_eq!(
+        (keepalive.verb(), keepalive.path(), keepalive.body.as_ref()),
+        ("GET", "/v1/keepalive", None)
+    );
+    assert_eq!(clock.asked(), [KEEPALIVE; 2]);
+    server.respond(keepalive.id(), 200, b"");
+    pool.run_until_stalled();
+
+    // Responses find their requests by id, whatever their order.
+    let first = spawner
+        .spawn_local_with_handle(ws.clone().request(get("/v1/first")))
+        .unwrap();
+    let second = spawner
+        .spawn_local_with_handle(ws.clone().request(get("/v1/second")))
+        .unwrap();
+    pool.run_until_stalled();
+    let requests = server.take_requests();
+    let id = |path: &str| {
+        requests
+            .iter()
+            .find(|request| request.path() == path)
+            .expect("sent")
+            .id()
+    };
+    assert_ne!(id("/v1/first"), id("/v1/second"));
+    server.respond(id("/v1/second"), 201, b"two");
+    server.respond(id("/v1/first"), 200, b"one");
+    pool.run_until_stalled();
+    let first = first.now_or_never().expect("answered").unwrap();
+    let second = second.now_or_never().expect("answered").unwrap();
+    assert_eq!((first.status(), first.body()), (200, &b"one"[..]));
+    assert_eq!((second.status(), second.body()), (201, &b"two"[..]));
+
+    // Signal's requests reach the pipe, which answers each under its id.
+    let envelope = Envelope {
+        client_timestamp: Some(1_700_000_000_000),
+        ..Default::default()
+    };
+    server.request(7, "PUT", "/api/v1/message", envelope.encode_to_vec());
+    server.request(8, "PUT", "/api/v1/queue/empty", Vec::new());
+    let incoming = spawner
+        .spawn_local_with_handle(pipe.stream().take(2).collect::<Vec<_>>())
+        .unwrap();
+    pool.run_until_stalled();
+    let incoming = incoming.now_or_never().expect("both delivered");
+    assert!(
+        matches!(&incoming[..],
+            [Ok(Incoming::Envelope(delivered)), Ok(Incoming::QueueEmpty)]
+                if *delivered == envelope),
+        "{incoming:?}"
+    );
+    let mut responses: Vec<_> = server
+        .take_sent()
+        .into_iter()
+        .map(|sent| match sent {
+            Sent::Frame(WebSocketMessage {
+                response: Some(response),
+                request: None,
+                ..
+            }) => (response.id(), response.status()),
+            other => panic!("not a response: {other:?}"),
+        })
+        .collect();
+    responses.sort_unstable();
+    assert_eq!(responses, [(7, 200), (8, 200)]);
+
+    // A task that stalls through several intervals sends one late keepalive,
+    // not a burst whose second would find the first unanswered.
+    clock.advance(KEEPALIVE * 3);
+    pool.run_until_stalled();
+    let [keepalive] = &server.take_requests()[..] else {
+        panic!("one keepalive")
+    };
+    assert_eq!(keepalive.path(), "/v1/keepalive");
+    assert!(server.is_open());
+
+    // Unanswered for a whole interval, it closes the socket as going away
+    // and ends the task, which says why.
+    clock.advance(KEEPALIVE - Duration::from_secs(1));
+    pool.run_until_stalled();
+    assert_eq!(server.take_sent(), []);
+    clock.advance(Duration::from_secs(1));
+    pool.run_until_stalled();
+    assert_eq!(server.take_sent(), [Sent::Close(1001)]);
+    assert_eq!(
+        running.now_or_never().expect("the task ended").unwrap(),
+        SocketEnd::KeepaliveUnanswered
+    );
+    assert!(!server.is_open());
+    assert!(ws.is_closed());
+    assert_eq!(clock.asked(), [KEEPALIVE; 3]);
+}
+
+/// The lane's runtime runs the task: lss spawns nothing, so the socket waits
+/// for its caller, and its connection need not be `Send`.
+#[test]
+fn socket_task_is_returned_not_spawned() {
+    let _ = <FakeConnection as AmbiguousIfSend<_>>::some_item;
+
+    // As the lane builds it (R1 D-RT-1): one thread, `!Send` tasks.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build_local(tokio::runtime::LocalOptions::default())
+        .unwrap();
+    runtime.block_on(async {
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let (service, transport) = push_service();
+        let clock = Rc::new(ManualClock::default());
+        let mut server = transport.accept_socket(&[]);
+
+        let (mut ws, task) = service
+            .ws::<Unidentified>(
+                "/v1/websocket/provisioning/",
+                "/v1/keepalive/provisioning",
+                &[],
+                None,
+                clock.clone(),
+            )
+            .await
+            .unwrap();
+        let connect = transport.take_connect();
+        assert_eq!(
+            connect.url.as_str(),
+            "wss://chat.test/v1/websocket/provisioning/"
+        );
+        assert!(connect.headers.is_empty(), "no credentials");
+
+        let running = {
+            // Until the caller polls the task, nothing runs: no task was
+            // spawned, no timer armed, and a request waits in the handle.
+            assert_eq!(metrics.num_alive_tasks(), 0);
+            let mut request = pin!(ws.request(get("/v1/address")));
+            assert!(poll!(request.as_mut()).is_pending());
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert!(poll!(request.as_mut()).is_pending());
+            assert_eq!(server.take_sent(), []);
+            assert_eq!(clock.asked(), []);
+
+            // The caller runs it, as the lane's `spawn_critical` does.
+            let running = tokio::task::spawn_local(task);
+            assert_eq!(metrics.num_alive_tasks(), 1);
+            let sent = sent_request(server.next_sent().await);
+            assert_eq!(sent.path(), "/v1/address");
+            server.respond(sent.id(), 200, b"");
+            assert_eq!(request.await.unwrap().status(), 200);
+            assert_eq!(clock.asked(), [KEEPALIVE]);
+            running
+        };
+
+        // Once the last handle is dropped, the task ends, released, and
+        // drops the connection.
+        drop(ws);
+        assert_eq!(running.await.unwrap().unwrap(), SocketEnd::Released);
+        assert!(!server.is_open());
+    });
+}
+
+#[test]
+fn dropping_the_task_closes_the_socket() {
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+    let (service, transport) = push_service();
+    let mut server = transport.accept_socket(&[]);
+    let (mut ws, task) = pool
+        .run_until(service.ws::<Identified>(
+            "/v1/websocket/",
+            "/v1/keepalive",
+            &[],
+            Some(credentials()),
+            Rc::new(ManualClock::default()),
+        ))
+        .unwrap();
+
+    let running = spawner.spawn_local_with_handle(task).unwrap();
+    let waiting = spawner
+        .spawn_local_with_handle(ws.request(get("/v1/devices")))
+        .unwrap();
+    pool.run_until_stalled();
+    assert_eq!(server.take_requests().len(), 1);
+    assert!(server.is_open());
+
+    // The caller drops the task, as a lane that ends does.
+    drop(running);
+    pool.run_until_stalled();
+    assert!(
+        !server.is_open(),
+        "the connection is dropped, which closes it"
+    );
+    assert_eq!(server.take_sent(), []);
+    assert!(ws.is_closed());
+    assert!(matches!(
+        waiting.now_or_never(),
+        Some(Err(ServiceError::WsClosing { .. }))
+    ));
+    assert!(matches!(
+        pool.run_until(ws.request(get("/v1/devices"))),
+        Err(ServiceError::WsClosing { .. })
+    ));
+}
+
+/// The server's close and a connection that breaks each end the task, which
+/// says how it ended, and fail the requests waiting on it.
+#[test]
+fn the_connection_ending_ends_the_task() {
+    for (end, ended) in [
+        (
+            Ok(WsEvent::Close {
+                code: 4409,
+                reason: "Connected elsewhere".into(),
+            }),
+            Ok(SocketEnd::Closed {
+                code: 4409,
+                reason: "Connected elsewhere".into(),
+            }),
+        ),
+        (
+            Err(TransportErrorKind::Closed),
+            Err(TransportErrorKind::Closed),
+        ),
+    ] {
+        let mut pool = LocalPool::new();
+        let spawner = pool.spawner();
+        let (service, transport) = push_service();
+        let mut server = transport.accept_socket(&[]);
+        let (mut ws, task) = pool
+            .run_until(service.ws::<Identified>(
+                "/v1/websocket/",
+                "/v1/keepalive",
+                &[],
+                Some(credentials()),
+                Rc::new(ManualClock::default()),
+            ))
+            .unwrap();
+        let running = spawner.spawn_local_with_handle(task).unwrap();
+        let waiting = spawner
+            .spawn_local_with_handle(ws.request(get("/v1/devices")))
+            .unwrap();
+        pool.run_until_stalled();
+        assert_eq!(server.take_requests().len(), 1);
+
+        server.event(end);
+        pool.run_until_stalled();
+        let result = running.now_or_never().expect("the task ended");
+        assert_eq!(result.map_err(transport_kind), ended);
+        assert!(!server.is_open());
+        assert_eq!(server.take_sent(), [], "the transport closes it");
+        assert!(ws.is_closed());
+        assert!(matches!(
+            waiting.now_or_never(),
+            Some(Err(ServiceError::WsClosing { .. }))
+        ));
+    }
+}
+
+/// A keepalive the connection can't send ends the task with the transport's
+/// error, not as if the socket had ended cleanly.
+#[test]
+fn a_keepalive_that_cannot_be_sent_fails_the_task() {
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+    let (service, transport) = push_service();
+    let clock = Rc::new(ManualClock::default());
+    let server = transport.accept_socket(&[]);
+    let (ws, task) = pool
+        .run_until(service.ws::<Identified>(
+            "/v1/websocket/",
+            "/v1/keepalive",
+            &[],
+            Some(credentials()),
+            clock.clone(),
+        ))
+        .unwrap();
+    let running = spawner.spawn_local_with_handle(task).unwrap();
+    pool.run_until_stalled();
+
+    server.fail_sends(TransportErrorKind::Closed);
+    clock.advance(KEEPALIVE);
+    pool.run_until_stalled();
+    let result = running.now_or_never().expect("the task ended");
+    assert_eq!(
+        result.map_err(transport_kind),
+        Err(TransportErrorKind::Closed)
+    );
+    assert!(!server.is_open());
+    assert!(ws.is_closed());
+}
+
+/// The kind of the transport's error that ended a socket.
+fn transport_kind(error: ServiceError) -> TransportErrorKind {
+    match error {
+        ServiceError::Transport(error) => error.kind(),
+        other => panic!("not the transport's error: {other:?}"),
+    }
 }

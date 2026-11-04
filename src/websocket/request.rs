@@ -1,6 +1,6 @@
 use std::fmt;
 
-use reqwest::Method;
+use http::Method;
 use serde::Serialize;
 
 use crate::{

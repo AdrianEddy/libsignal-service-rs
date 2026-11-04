@@ -556,7 +556,7 @@ impl AccountManager {
     /// Returns the avatar url path.
     pub async fn upload_versioned_profile<
         's,
-        C: std::io::Read + Send + 's,
+        C: std::io::Read + 's,
         R: Rng + CryptoRng,
         S: AsRef<str>,
     >(

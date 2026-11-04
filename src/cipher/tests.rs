@@ -4,6 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::future::{self, FutureExt as _, LocalBoxFuture};
 use libsignal_protocol::{
     kem, process_prekey_bundle, Aci, DeviceId, IdentityKeyPair,
     InMemSignalProtocolStore, KeyPair, PreKeyBundle, ProtocolAddress,
@@ -18,11 +19,16 @@ use crate::{
     transport::Clock,
 };
 
+/// A clock that stands still, so no wait on it ends.
 struct FixedClock(SystemTime);
 
 impl Clock for FixedClock {
     fn now(&self) -> SystemTime {
         self.0
+    }
+
+    fn sleep(&self, _: Duration) -> LocalBoxFuture<'static, ()> {
+        future::pending().boxed_local()
     }
 }
 

@@ -6,10 +6,13 @@
 //! and the record is stored, so a failure after the decrypt loses the message
 //! for good. Padding must therefore never depend on the record.
 
-use std::{rc::Rc, time::SystemTime};
+use std::{
+    rc::Rc,
+    time::{Duration, SystemTime},
+};
 
 use async_trait::async_trait;
-use futures::lock::Mutex;
+use futures::{future::LocalBoxFuture, lock::Mutex};
 use libsignal_protocol::{
     initiate_session, kem, message_decrypt, message_encrypt, Aci,
     CiphertextMessage, CiphertextMessageType, DeviceId, Direction,
@@ -36,11 +39,17 @@ use uuid::Uuid;
 
 type StoreResult<T> = Result<T, SignalProtocolError>;
 
+/// The wall clock, for decrypts; these tests open no socket, so nothing
+/// waits on it.
 struct SystemClock;
 
 impl Clock for SystemClock {
     fn now(&self) -> SystemTime {
         SystemTime::now()
+    }
+
+    fn sleep(&self, _: Duration) -> LocalBoxFuture<'static, ()> {
+        unreachable!("these tests open no socket")
     }
 }
 

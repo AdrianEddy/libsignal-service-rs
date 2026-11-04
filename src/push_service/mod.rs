@@ -1,14 +1,15 @@
-use std::{io::Write as _, rc::Rc, sync::LazyLock, time::Duration};
+use std::{
+    future::Future, io::Write as _, rc::Rc, sync::LazyLock, time::Duration,
+};
 
 use crate::{
     configuration::{Endpoint, ServiceCredentials},
     prelude::ServiceConfiguration,
     transport::{
-        HttpBody, HttpRequest, HttpResponse, Transport, TransportError,
-        TransportErrorKind,
+        Clock, HttpBody, HttpRequest, HttpResponse, Transport, WsConnect,
     },
     utils::serde_device_id_vec,
-    websocket::{SignalWebSocket, WebSocketType},
+    websocket::{SignalWebSocket, SocketEnd, WebSocketType},
 };
 
 use base64::{prelude::BASE64_STANDARD, write::EncoderStringWriter};
@@ -17,7 +18,6 @@ use http::{
     HeaderMap, HeaderName, HeaderValue, Method,
 };
 use libsignal_core::DeviceId;
-use reqwest_websocket::Upgrade;
 use serde::{Deserialize, Serialize};
 use tracing::{debug_span, Instrument};
 
@@ -100,7 +100,8 @@ pub struct StaleDevices {
 
 #[derive(Clone)]
 pub struct PushService {
-    cfg: ServiceConfiguration,
+    /// Shared, so a clone (each socket handle holds one) copies no URL or key.
+    cfg: Rc<ServiceConfiguration>,
     /// The account's `Authorization` value, built once and marked sensitive.
     authorization: Option<HeaderValue>,
     transport: Rc<dyn Transport>,
@@ -113,7 +114,7 @@ impl PushService {
         transport: Rc<dyn Transport>,
     ) -> Self {
         Self {
-            cfg,
+            cfg: Rc::new(cfg),
             authorization: credentials
                 .and_then(|c| c.authorization())
                 .map(|auth| auth.header_value()),
@@ -154,53 +155,50 @@ impl PushService {
         })
     }
 
+    /// Opens a WebSocket to the chat service at `path` through the
+    /// transport, with basic authentication when `credentials` are given.
+    ///
+    /// Returns the socket's handle and its task, which the caller runs and
+    /// `clock` times (see [`SignalWebSocket::new`]).
     pub async fn ws<C: WebSocketType>(
-        &mut self,
+        &self,
         path: &str,
         keepalive_path: &str,
         additional_headers: &[(&'static str, &str)],
         credentials: Option<ServiceCredentials>,
-    ) -> Result<SignalWebSocket<C>, ServiceError> {
+        clock: Rc<dyn Clock>,
+    ) -> Result<
+        (
+            SignalWebSocket<C>,
+            impl Future<Output = Result<SocketEnd, ServiceError>> + 'static,
+        ),
+        ServiceError,
+    > {
         let span = debug_span!("websocket");
 
         let mut url = Endpoint::service(path).into_url(&self.cfg)?;
         url.set_scheme("wss").expect("valid https base url");
 
-        // The WebSocket still connects through reqwest, trusting the
-        // configuration's certificate authority, until it moves onto
-        // `Transport::websocket`.
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut headers =
+            HeaderMap::with_capacity(additional_headers.len() + 1);
+        for (name, value) in additional_headers {
+            headers.append(
+                HeaderName::from_bytes(name.as_bytes())
+                    .map_err(http::Error::from)?,
+                HeaderValue::from_str(value).map_err(http::Error::from)?,
+            );
         }
-        let client = reqwest::Certificate::from_pem(
-            self.cfg.certificate_authority.as_bytes(),
-        )
-        .and_then(|root| {
-            reqwest::ClientBuilder::new()
-                .tls_certs_only([root])
-                .connect_timeout(Duration::from_secs(10))
-                .read_timeout(Duration::from_secs(65))
-                .user_agent(crate::USER_AGENT)
-                .http1_only()
-                .build()
-        })
-        .map_err(|e| TransportError::new(TransportErrorKind::Other, e))?;
-
-        let mut builder = client.get(url);
-        for (key, value) in additional_headers {
-            builder = builder.header(*key, *value);
-        }
-
         if let Some(credentials) = credentials {
-            builder =
-                builder.basic_auth(credentials.login(), credentials.password);
+            let auth = HttpAuth {
+                username: credentials.login(),
+                password: credentials.password.unwrap_or_default(),
+            };
+            headers.insert(AUTHORIZATION, auth.header_value());
         }
 
-        let ws = builder
-            .upgrade()
-            .send()
-            .await?
-            .into_websocket()
+        let upgrade = self
+            .transport
+            .websocket(WsConnect { url, headers })
             .instrument(span.clone())
             .await?;
 
@@ -210,13 +208,12 @@ impl PushService {
             transport: self.transport.clone(),
         };
         let (ws, task) = SignalWebSocket::new(
-            ws,
+            upgrade,
             keepalive_path.to_owned(),
             unidentified_push_service,
+            clock,
         );
-        let task = task.instrument(span);
-        tokio::task::spawn(task);
-        Ok(ws)
+        Ok((ws, task.instrument(span)))
     }
 
     pub(crate) async fn get_group(
@@ -234,12 +231,6 @@ impl PushService {
         .await?
         .protobuf()
         .await
-    }
-}
-
-impl From<reqwest_websocket::Error> for ServiceError {
-    fn from(error: reqwest_websocket::Error) -> Self {
-        TransportError::new(TransportErrorKind::Other, error).into()
     }
 }
 
