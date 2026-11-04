@@ -390,23 +390,9 @@ where
                     csprng,
                 )
                 .await?
-                .as_slice()
-                .to_vec();
+                .plaintext;
 
-                let session_record = self
-                    .protocol_store
-                    .load_session(&sender)
-                    .await?
-                    .ok_or_else(|| {
-                        SignalProtocolError::SessionNotFound(
-                            SessionNotFound::new(sender, "decrypt"),
-                        )
-                    })?;
-
-                strip_padding_version(
-                    session_record.session_version()?,
-                    &mut data,
-                )?;
+                strip_padding(&mut data)?;
                 DecryptedPayload {
                     data,
                     sender: source_service_id,
@@ -454,24 +440,9 @@ where
                     &mut self.protocol_store.clone(),
                     csprng,
                 )
-                .await?
-                .as_slice()
-                .to_vec();
+                .await?;
 
-                let session_record = self
-                    .protocol_store
-                    .load_session(&sender)
-                    .await?
-                    .ok_or_else(|| {
-                        SignalProtocolError::SessionNotFound(
-                            SessionNotFound::new(sender, "decrypt"),
-                        )
-                    })?;
-
-                strip_padding_version(
-                    session_record.session_version()?,
-                    &mut data,
-                )?;
+                strip_padding(&mut data)?;
                 DecryptedPayload {
                     data,
                     sender: source_service_id,
@@ -697,23 +668,6 @@ fn add_padding(version: u32, contents: &[u8]) -> Result<Vec<u8>, ServiceError> {
     }
 }
 
-#[expect(clippy::comparison_chain)]
-fn strip_padding_version(
-    version: u32,
-    contents: &mut Vec<u8>,
-) -> Result<(), ServiceError> {
-    if version < 2 {
-        Err(ServiceError::InvalidFrame {
-            reason: "unknown version",
-        })
-    } else if version == 2 {
-        Ok(())
-    } else {
-        strip_padding(contents)?;
-        Ok(())
-    }
-}
-
 fn strip_padding(contents: &mut Vec<u8>) -> Result<(), ServiceError> {
     let new_length = Iso7816::raw_unpad(contents)?.len();
     contents.resize(new_length, 0);
@@ -899,6 +853,7 @@ async fn sealed_sender_decrypt_with_validated_usmc(
                 &mut rng,
             )
             .await?
+            .plaintext
         },
         CiphertextMessageType::SenderKey => {
             group_decrypt(usmc.contents()?, sender_key_store, remote_address)
