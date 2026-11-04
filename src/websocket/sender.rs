@@ -39,7 +39,10 @@ error_mapper! {
         PRECONDITION_REQUIRED => ProofRequiredError(crate::push_service::ProofRequired),
 }
 
-impl<C: WebSocketType> SignalWebSocket<C> {
+impl SignalWebSocket<Identified> {
+    /// Sends `messages` as us: the server sees the sender. A sealed-sender
+    /// send goes on the unauthenticated socket instead
+    /// (`SignalWebSocket::<Unidentified>::send_messages_unidentified`).
     pub async fn send_messages(
         &mut self,
         messages: OutgoingPushMessages,
@@ -52,7 +55,12 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             .json(&messages)?;
         self.request_json_with(request, put_messages_errors).await
     }
+}
 
+impl SignalWebSocket<Unidentified> {
+    /// Sends sealed-sender `messages` with the recipient's access key. Only
+    /// the unauthenticated socket has it: the server takes any authenticated
+    /// request as an identified send and ignores the key.
     pub async fn send_messages_unidentified(
         &mut self,
         messages: OutgoingPushMessages,

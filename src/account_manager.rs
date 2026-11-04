@@ -716,7 +716,7 @@ impl AccountManager {
 
         // For every linked device, we generate a new set of pre-keys, and send them to the device.
         let local_device_ids = aci_protocol_store
-            .get_sub_device_sessions(&local_aci.into())
+            .get_sub_device_sessions(&local_aci.into(), self.clock.now())
             .await?;
 
         let mut device_messages =

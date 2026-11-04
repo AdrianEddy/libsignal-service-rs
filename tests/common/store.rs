@@ -3,7 +3,7 @@
 //! [`MessageSender`](libsignal_service::sender::MessageSender) clone their
 //! store for every call, so a session they store must outlive the clone.
 
-use std::{ops::Deref, rc::Rc, sync::Arc};
+use std::{ops::Deref, rc::Rc, sync::Arc, time::SystemTime};
 
 use async_trait::async_trait;
 use futures::lock::Mutex;
@@ -278,6 +278,7 @@ impl<P: Deref<Target = Mutex<InMemSignalProtocolStore>>> SessionStoreExt
     async fn get_sub_device_sessions(
         &self,
         _: &ServiceId,
+        _: SystemTime,
     ) -> StoreResult<Vec<DeviceId>> {
         Ok(Vec::new())
     }

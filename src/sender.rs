@@ -7,7 +7,7 @@ use libsignal_protocol::{
     SessionNotFound, SignalProtocolError,
 };
 use rand::{rng, CryptoRng, Rng};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
 use tracing_futures::Instrument;
 use uuid::Uuid;
 use zkgroup::GROUP_IDENTIFIER_LEN;
@@ -22,11 +22,11 @@ use crate::{
         sync_message::{
             self, message_request_response, MessageRequestResponse,
         },
-        AttachmentPointer, SyncMessage,
+        AttachmentPointer, PniSignatureMessage, SyncMessage,
     },
     push_service::*,
     service_address::ServiceIdExt,
-    session_store::SessionStoreExt,
+    session_store::{has_usable_session, SessionStoreExt},
     timestamp::epoch_millis,
     unidentified_access::UnidentifiedAccess,
     utils::{serde_device_id, serde_service_id},
@@ -158,6 +158,109 @@ pub enum ThreadIdentifier {
 pub struct EncryptedMessages {
     messages: Vec<OutgoingPushMessage>,
     used_identity_key: IdentityKey,
+}
+
+/// The sync transcript of a message we sent at `timestamp`: the
+/// `SyncMessage.Sent` from which our other devices file it as sent.
+///
+/// `destination` is the 1:1 conversation's (`None` for a group), and
+/// `delivered` lists each recipient the message reached. Only a `DataMessage`
+/// or an `EditMessage` has a transcript; other content gives `None`. The
+/// sync message's padding comes from `csprng`.
+///
+/// `expiration_start` is when the message first reached a recipient (for
+/// Note to Self, when the transcript is sent), in milliseconds since the
+/// epoch; our devices start a disappearing message's timer from it. It is
+/// not `timestamp`, which names the message and is fixed when it is
+/// composed, however late it goes out. As Android does, it goes only with a
+/// `DataMessage` whose timer runs (an edit keeps the timer of the message it
+/// edits).
+///
+/// As Desktop and Android do, a recipient's identity key goes with it only
+/// when the message went to its PNI: our devices learn the PNI's key from it.
+///
+/// It needs no [`MessageSender`], so a caller can make it with a store that
+/// is not `Sync`.
+pub fn sent_transcript<'a, R: Rng + CryptoRng>(
+    destination: Option<&ServiceId>,
+    content_body: ContentBody,
+    timestamp: u64,
+    expiration_start: u64,
+    delivered: impl IntoIterator<Item = &'a SentMessage>,
+    csprng: &mut R,
+) -> Option<ContentBody> {
+    use sync_message::sent::UnidentifiedDeliveryStatus;
+    let (message, edit_message) = match content_body {
+        ContentBody::DataMessage(m) => (Some(m), None),
+        ContentBody::EditMessage(m) => (None, Some(m)),
+        content_body => {
+            tracing::trace!(?content_body, "not syncing to self");
+            return None;
+        },
+    };
+    let unidentified_status: Vec<UnidentifiedDeliveryStatus> = delivered
+        .into_iter()
+        .map(|sent| {
+            let SentMessage {
+                recipient,
+                unidentified,
+                used_identity_key,
+                ..
+            } = sent;
+            UnidentifiedDeliveryStatus {
+                destination_service_id: Some(recipient.service_id_string()),
+                destination_service_id_binary: Some(
+                    recipient.service_id_binary(),
+                ),
+                unidentified: Some(*unidentified),
+                destination_pni_identity_key: matches!(
+                    recipient,
+                    ServiceId::Pni(_)
+                )
+                .then(|| used_identity_key.serialize().into()),
+            }
+        })
+        .collect();
+    Some(ContentBody::SynchronizeMessage(SyncMessage {
+        content: Some(sync_message::Content::Sent(sync_message::Sent {
+            destination_service_id: destination
+                .map(ServiceId::service_id_string),
+            destination_service_id_binary: destination
+                .map(ServiceId::service_id_binary),
+            destination_e164: None,
+            expiration_start_timestamp: message
+                .as_ref()
+                .and_then(|m| m.expire_timer)
+                .is_some_and(|timer| timer > 0)
+                .then_some(expiration_start),
+            message,
+            edit_message,
+            timestamp: Some(timestamp),
+            unidentified_status,
+            ..Default::default()
+        })),
+        ..SyncMessage::with_padding(csprng)
+    }))
+}
+
+/// The PNI signature for a message to a contact who knows us by our PNI
+/// (`local_pni`): our PNI identity's signature over our ACI identity key,
+/// which tells the recipient that the two are one account.
+///
+/// It needs no [`MessageSender`], so a caller can make it with a store that
+/// is not `Sync`.
+pub fn pni_signature<R: Rng + CryptoRng>(
+    pni_identity: &IdentityKeyPair,
+    aci_identity: &IdentityKey,
+    local_pni: Pni,
+    csprng: &mut R,
+) -> Result<PniSignatureMessage, SignalProtocolError> {
+    let signature =
+        pni_identity.sign_alternate_identity(aci_identity, csprng)?;
+    Ok(PniSignatureMessage {
+        pni: Some(local_pni.service_id_binary()),
+        signature: Some(signature.into()),
+    })
 }
 
 impl<S> MessageSender<S>
@@ -334,7 +437,10 @@ where
     async fn is_multi_device(&self) -> bool {
         if self.device_id == *DEFAULT_DEVICE_ID {
             self.protocol_store
-                .get_sub_device_sessions(&self.local_aci.into())
+                .get_sub_device_sessions(
+                    &self.local_aci.into(),
+                    self.cipher.clock.now(),
+                )
                 .await
                 .is_ok_and(|s| !s.is_empty())
         } else {
@@ -365,14 +471,14 @@ where
         // only send a sync message when sending to self and skip the rest of the process
         if message_to_self && is_multi_device && !sync_message {
             debug!("sending note to self");
-            if let Some(sync_message) = self
-                .create_multi_device_sent_transcript_content(
-                    Some(recipient),
-                    content_body,
-                    timestamp,
-                    None,
-                )
-            {
+            if let Some(sync_message) = sent_transcript(
+                Some(recipient),
+                content_body,
+                timestamp,
+                epoch_millis(&*self.cipher.clock),
+                [],
+                &mut rng(),
+            ) {
                 return self
                     .try_send_message(
                         *recipient,
@@ -419,11 +525,13 @@ where
             } else {
                 // Only some ContentBody types are syncable to self,
                 // not getting a content body to sync is not an error.
-                self.create_multi_device_sent_transcript_content(
+                sent_transcript(
                     Some(recipient),
                     content_body,
                     timestamp,
-                    Some(&result),
+                    epoch_millis(&*self.cipher.clock),
+                    result.as_ref().ok(),
+                    &mut rng(),
                 )
             };
             if let Some(body) = sync_body {
@@ -491,14 +599,14 @@ where
 
         // we only need to send a synchronization message once
         if needs_sync_in_results || self.is_multi_device().await {
-            if let Some(sync_message) = self
-                .create_multi_device_sent_transcript_content(
-                    None,
-                    content_body.clone(),
-                    timestamp,
-                    &results,
-                )
-            {
+            if let Some(sync_message) = sent_transcript(
+                None,
+                content_body.clone(),
+                timestamp,
+                epoch_millis(&*self.cipher.clock),
+                results.iter().filter_map(|result| result.as_ref().ok()),
+                &mut rng(),
+            ) {
                 // Note: the result of sending a sync message is not included in results
                 // See Signal Android `SignalServiceMessageSender.java:2817`
                 if let Err(error) = self
@@ -599,7 +707,16 @@ where
 
         let mut content = content_body.clone().into_proto();
         if include_pni_signature {
-            content.pni_signature_message = Some(self.create_pni_signature()?);
+            let pni_identity = self
+                .pni_identity
+                .as_ref()
+                .expect("PNI key set when PNI signature requested");
+            content.pni_signature_message = Some(pni_signature(
+                pni_identity,
+                self.aci_identity.identity_key(),
+                self.local_pni,
+                &mut rng(),
+            )?);
         }
 
         let content_bytes = content.encode_to_vec();
@@ -883,24 +1000,6 @@ where
         Ok(())
     }
 
-    #[tracing::instrument(level = "trace", skip(self))]
-    fn create_pni_signature(
-        &mut self,
-    ) -> Result<crate::proto::PniSignatureMessage, MessageSenderError> {
-        let mut rng = rng();
-        let signature = self
-            .pni_identity
-            .expect("PNI key set when PNI signature requested")
-            .sign_alternate_identity(
-                self.aci_identity.identity_key(),
-                &mut rng,
-            )?;
-        Ok(crate::proto::PniSignatureMessage {
-            pni: Some(self.local_pni.service_id_binary()),
-            signature: Some(signature.into()),
-        })
-    }
-
     // Equivalent with `getEncryptedMessages`
     #[tracing::instrument(
         level = "trace",
@@ -917,7 +1016,7 @@ where
 
         let mut devices: HashSet<DeviceId> = self
             .protocol_store
-            .get_sub_device_sessions(recipient)
+            .get_sub_device_sessions(recipient, self.cipher.clock.now())
             .await?
             .into_iter()
             .collect();
@@ -1032,13 +1131,16 @@ where
             recipient_protocol_address
         );
 
-        // establish a session with the recipient/device if necessary
+        // establish a session with the recipient/device if necessary: one
+        // the cipher encrypts on, as a record with only archived sessions or
+        // a stale one has none, and building one archives what it replaces.
         // no need to establish a session with ourselves (and our own current device)
-        if self
+        let now = self.cipher.clock.now();
+        if !self
             .protocol_store
             .load_session(&recipient_protocol_address)
             .await?
-            .is_none()
+            .is_some_and(|record| has_usable_session(&record, now))
         {
             info!(
                 "establishing new session with {}",
@@ -1106,67 +1208,5 @@ where
             .await?;
 
         Ok(message)
-    }
-
-    fn create_multi_device_sent_transcript_content<'a>(
-        &mut self,
-        recipient: Option<&ServiceId>,
-        content_body: ContentBody,
-        timestamp: u64,
-        send_message_results: impl IntoIterator<Item = &'a SendMessageResult>,
-    ) -> Option<ContentBody> {
-        use sync_message::sent::UnidentifiedDeliveryStatus;
-        let (message, edit_message) = match content_body {
-            ContentBody::DataMessage(m) => (Some(m), None),
-            ContentBody::EditMessage(m) => (None, Some(m)),
-            content_body => {
-                tracing::trace!(?content_body, "not syncing to self");
-                return None;
-            },
-        };
-        let unidentified_status: Vec<UnidentifiedDeliveryStatus> =
-            send_message_results
-                .into_iter()
-                .filter_map(|result| result.as_ref().ok())
-                .map(|sent| {
-                    let SentMessage {
-                        recipient,
-                        unidentified,
-                        used_identity_key,
-                        ..
-                    } = sent;
-                    UnidentifiedDeliveryStatus {
-                        destination_service_id: Some(
-                            recipient.service_id_string(),
-                        ),
-                        destination_service_id_binary: Some(
-                            recipient.service_id_binary(),
-                        ),
-                        unidentified: Some(*unidentified),
-                        destination_pni_identity_key: Some(
-                            used_identity_key.serialize().into(),
-                        ),
-                    }
-                })
-                .collect();
-        Some(ContentBody::SynchronizeMessage(SyncMessage {
-            content: Some(sync_message::Content::Sent(sync_message::Sent {
-                destination_service_id: recipient
-                    .map(ServiceId::service_id_string),
-                destination_service_id_binary: recipient
-                    .map(ServiceId::service_id_binary),
-                destination_e164: None,
-                expiration_start_timestamp: message
-                    .as_ref()
-                    .and_then(|m| m.expire_timer)
-                    .map(|_| timestamp),
-                message,
-                edit_message,
-                timestamp: Some(timestamp),
-                unidentified_status,
-                ..Default::default()
-            })),
-            ..SyncMessage::with_padding(&mut rng())
-        }))
     }
 }

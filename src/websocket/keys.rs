@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use base64::Engine as _;
 use http::Method;
 use libsignal_core::DeviceId;
 use libsignal_protocol::{
@@ -13,10 +14,12 @@ use crate::{
     pre_keys::{
         KyberPreKeyEntity, PreKeyEntity, PreKeyState, SignedPreKeyEntity,
     },
+    proto::WebSocketRequestMessage,
     push_service::response::SignalServiceResponse,
     push_service::DEFAULT_DEVICE_ID,
     sender::OutgoingPushMessage,
-    utils::{serde_base64, serde_device_id},
+    unidentified_access::UnidentifiedAccess,
+    utils::{serde_base64, serde_device_id, BASE64_RELAXED},
     websocket::{self, registration::VerifyAccountResponse, SignalWebSocket},
 };
 
@@ -46,6 +49,27 @@ pub struct PreKeyResponseItem {
     pub signed_pre_key: SignedPreKeyEntity,
     pub pre_key: Option<PreKeyEntity>,
     pub pq_pre_key: KyberPreKeyEntity,
+}
+
+impl PreKeyResponse {
+    fn into_bundles(self) -> Result<Vec<PreKeyBundle>, ServiceError> {
+        let identity = IdentityKey::decode(&self.identity_key)?;
+        self.devices
+            .into_iter()
+            .map(|device| device.into_bundle(identity))
+            .collect()
+    }
+}
+
+/// The path of a prekey fetch: every device's bundle for device 1
+/// (`/v2/keys/{service id}/*`), only that device's for any other.
+fn pre_keys_path(destination: &ServiceId, device_id: DeviceId) -> String {
+    let destination = destination.service_id_string();
+    if device_id == *DEFAULT_DEVICE_ID {
+        format!("/v2/keys/{destination}/*")
+    } else {
+        format!("/v2/keys/{destination}/{device_id}")
+    }
 }
 
 impl PreKeyResponseItem {
@@ -187,34 +211,26 @@ impl SignalWebSocket<websocket::Identified> {
         device.into_bundle(identity)
     }
 
-    pub(crate) async fn get_pre_keys(
+    /// The prekey bundles of `destination`'s devices, to build sessions from:
+    /// every device's for device 1 (`GET /v2/keys/{service id}/*`), only that
+    /// device's for any other.
+    ///
+    /// The server learns who asks for whose keys. For a sealed-sender send,
+    /// fetch on the unauthenticated socket with the recipient's access key
+    /// instead (`SignalWebSocket::<Unidentified>::get_pre_keys`).
+    pub async fn get_pre_keys(
         &mut self,
         destination: &ServiceId,
         device_id: DeviceId,
     ) -> Result<Vec<PreKeyBundle>, ServiceError> {
-        let path = if device_id == *DEFAULT_DEVICE_ID {
-            format!("/v2/keys/{}/*", destination.service_id_string())
-        } else {
-            format!(
-                "/v2/keys/{}/{}",
-                destination.service_id_string(),
-                device_id
-            )
-        };
-        let pre_key_response: PreKeyResponse = self
-            .http_request(Method::GET, path)?
+        self.http_request(Method::GET, pre_keys_path(destination, device_id))?
             .send()
             .await?
             .service_error_for_status()
             .await?
-            .json()
-            .await?;
-        let mut pre_keys = vec![];
-        let identity = IdentityKey::decode(&pre_key_response.identity_key)?;
-        for device in pre_key_response.devices {
-            pre_keys.push(device.into_bundle(identity)?);
-        }
-        Ok(pre_keys)
+            .json::<PreKeyResponse>()
+            .await?
+            .into_bundles()
     }
 
     pub async fn get_sender_certificate(
@@ -290,5 +306,38 @@ impl SignalWebSocket<websocket::Identified> {
         .await?
         .json()
         .await
+    }
+}
+
+impl SignalWebSocket<websocket::Unidentified> {
+    /// The prekey bundles of `destination`'s devices, as the authenticated
+    /// socket's `get_pre_keys` gives them, fetched with `destination`'s access
+    /// key so that the server doesn't learn who asks: the fetch for a
+    /// sealed-sender send, as Desktop and Android make it.
+    ///
+    /// A key the server refuses (401 or 403, also for an account that doesn't
+    /// exist) is [`ServiceError::Unauthorized`]; the official clients then
+    /// fetch on the authenticated socket and send that recipient's message
+    /// unsealed.
+    pub async fn get_pre_keys(
+        &mut self,
+        destination: &ServiceId,
+        device_id: DeviceId,
+        access: &UnidentifiedAccess,
+    ) -> Result<Vec<PreKeyBundle>, ServiceError> {
+        let request = WebSocketRequestMessage::new(Method::GET)
+            .path(pre_keys_path(destination, device_id))
+            .header(
+                "Unidentified-Access-Key",
+                BASE64_RELAXED.encode(&access.key),
+            )
+            .build();
+        self.request(request)
+            .await?
+            .service_error_for_status()
+            .await?
+            .json::<PreKeyResponse>()
+            .await?
+            .into_bundles()
     }
 }

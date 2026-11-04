@@ -11,12 +11,11 @@ use libsignal_protocol::{
     PlaintextContent, Pni, PreKeySignalMessage, PreKeyStore, ProtocolAddress,
     ProtocolStore, PublicKey, SealedSenderDecryptionResult, SenderCertificate,
     SenderKeyDistributionMessage, SenderKeyStore, ServiceId, SessionNotFound,
-    SessionStore, SessionUsabilityRequirements, SignalMessage,
-    SignalProtocolError, SignedPreKeyStore, Timestamp,
-    UnidentifiedSenderMessageContent,
+    SessionStore, SignalMessage, SignalProtocolError, SignedPreKeyStore,
+    Timestamp, UnidentifiedSenderMessageContent,
 };
 use prost::Message;
-use rand::{rng, CryptoRng, Rng};
+use rand::{CryptoRng, Rng};
 use uuid::Uuid;
 
 use crate::{
@@ -25,7 +24,7 @@ use crate::{
     proto::PniSignatureMessage,
     push_service::{ServiceError, DEFAULT_DEVICE_ID},
     sender::OutgoingPushMessage,
-    session_store::SessionStoreExt,
+    session_store::{has_usable_session, SessionStoreExt},
     transport::Clock,
     utils::BASE64_RELAXED,
     ServiceIdExt,
@@ -467,7 +466,11 @@ where
                 } = sealed_sender_decrypt(
                     ciphertext,
                     &self.trust_roots,
-                    Timestamp::from_epoch_millis(envelope.client_timestamp()),
+                    // When the server took the message, as Desktop and
+                    // Android check it: the sender chooses the client
+                    // timestamp, so a back-dated one would pass an expired
+                    // certificate, and a fast clock would fail a valid one.
+                    Timestamp::from_epoch_millis(envelope.server_timestamp()),
                     None,
                     self.local_address.clone(),
                     &mut self.protocol_store.clone(),
@@ -476,6 +479,7 @@ where
                     &mut self.protocol_store.clone(),
                     &mut self.protocol_store.clone(),
                     &mut self.protocol_store,
+                    csprng,
                 )
                 .await?;
 
@@ -547,6 +551,14 @@ where
         Ok(Plaintext { metadata, message })
     }
 
+    /// Encrypts `content` (a serialized `Content`, which this pads) for one
+    /// device, through the store's session with `address`, and stores the
+    /// session the encryption moved on. With `unidentified_access`, the
+    /// sender certificate, the message is sealed (sealed sender).
+    ///
+    /// A device without a session that passes [`has_usable_session`] at the
+    /// clock's time fails with [`SignalProtocolError::SessionNotFound`]: build
+    /// one from the device's prekey bundle first.
     #[tracing::instrument(
         skip(address, unidentified_access, content, csprng),
         fields(
@@ -555,39 +567,26 @@ where
             content_length = content.len(),
         )
     )]
-    pub(crate) async fn encrypt<R: Rng + CryptoRng>(
+    pub async fn encrypt<R: Rng + CryptoRng>(
         &mut self,
         address: &ProtocolAddress,
         unidentified_access: Option<&SenderCertificate>,
         content: &[u8],
         csprng: &mut R,
     ) -> Result<OutgoingPushMessage, ServiceError> {
-        let mut rng = rng();
         let now = self.clock.now();
 
         let session_record = self
             .protocol_store
             .load_session(address)
             .await?
+            .filter(|record| has_usable_session(record, now))
             .ok_or_else(|| {
-            SignalProtocolError::SessionNotFound(SessionNotFound::new(
-                address.clone(),
-                "encrypt",
-            ))
-        })?;
-
-        let record_usable = session_record
-            .has_usable_sender_chain(
-                now,
-                SessionUsabilityRequirements::NotStale,
-            )
-            .unwrap_or(false);
-        if !record_usable {
-            Err(SignalProtocolError::SessionNotFound(SessionNotFound::new(
-                address.clone(),
-                "encrypt",
-            )))?;
-        }
+                SignalProtocolError::SessionNotFound(SessionNotFound::new(
+                    address.clone(),
+                    "encrypt",
+                ))
+            })?;
 
         let padded_content =
             add_padding(session_record.session_version()?, content)?;
@@ -622,7 +621,7 @@ where
                 &mut self.protocol_store.clone(),
                 &mut self.protocol_store.clone(),
                 now,
-                &mut rng,
+                csprng,
             )
             .await?;
 
@@ -742,13 +741,14 @@ impl From<SignalProtocolError> for SealedSenderDecryptionError {
         pre_key_store,
         signed_pre_key_store,
         sender_key_store,
-        kyber_pre_key_store
+        kyber_pre_key_store,
+        csprng
     ),
     fields(
         ciphertext = ciphertext.len(),
     )
 )]
-async fn sealed_sender_decrypt(
+async fn sealed_sender_decrypt<R: Rng + CryptoRng>(
     ciphertext: &[u8],
     trust_roots: &[PublicKey],
     timestamp: Timestamp,
@@ -760,6 +760,7 @@ async fn sealed_sender_decrypt(
     signed_pre_key_store: &mut dyn SignedPreKeyStore,
     sender_key_store: &mut dyn SenderKeyStore,
     kyber_pre_key_store: &mut dyn KyberPreKeyStore,
+    csprng: &mut R,
 ) -> Result<SealedSenderDecryptionResult, SealedSenderDecryptionError> {
     let usmc =
         sealed_sender_decrypt_to_usmc(ciphertext, identity_store).await?;
@@ -811,6 +812,7 @@ async fn sealed_sender_decrypt(
         signed_pre_key_store,
         sender_key_store,
         kyber_pre_key_store,
+        csprng,
     )
     .await
     .map_err(|inner| SealedSenderDecryptionError {
@@ -820,7 +822,7 @@ async fn sealed_sender_decrypt(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn sealed_sender_decrypt_with_validated_usmc(
+async fn sealed_sender_decrypt_with_validated_usmc<R: Rng + CryptoRng>(
     usmc: &UnidentifiedSenderMessageContent,
     remote_address: &ProtocolAddress,
     local_address: &ProtocolAddress,
@@ -830,9 +832,8 @@ async fn sealed_sender_decrypt_with_validated_usmc(
     signed_pre_key_store: &mut dyn SignedPreKeyStore,
     sender_key_store: &mut dyn SenderKeyStore,
     kyber_pre_key_store: &mut dyn KyberPreKeyStore,
+    csprng: &mut R,
 ) -> Result<SealedSenderDecryptionResult, SignalProtocolError> {
-    let mut rng = rng();
-
     let message = match usmc.msg_type()? {
         CiphertextMessageType::Whisper => {
             let ctext = SignalMessage::try_from(usmc.contents()?)?;
@@ -842,7 +843,7 @@ async fn sealed_sender_decrypt_with_validated_usmc(
                 local_address,
                 session_store,
                 identity_store,
-                &mut rng,
+                csprng,
             )
             .await?
         },
@@ -857,7 +858,7 @@ async fn sealed_sender_decrypt_with_validated_usmc(
                 pre_key_store,
                 signed_pre_key_store,
                 kyber_pre_key_store,
-                &mut rng,
+                csprng,
             )
             .await?
             .plaintext
