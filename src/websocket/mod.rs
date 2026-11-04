@@ -8,7 +8,7 @@ use std::rc::Rc;
 use bytes::Bytes;
 use futures::channel::{mpsc, oneshot};
 use futures::prelude::*;
-use futures::stream::FuturesUnordered;
+use futures::stream::{FusedStream, FuturesUnordered};
 use http::{HeaderMap, Method, StatusCode};
 use tracing::debug;
 
@@ -18,7 +18,9 @@ use crate::proto::{
     WebSocketResponseMessage,
 };
 use crate::push_service::{self, ServiceError, SignalServiceResponse};
-use crate::transport::{Clock, WsConnection, WsEvent, WsUpgrade};
+use crate::transport::{
+    Clock, TransportError, WsConnection, WsEvent, WsUpgrade,
+};
 
 pub mod account;
 pub mod calling;
@@ -40,8 +42,33 @@ type RequestStreamItem = (
     oneshot::Sender<WebSocketResponseMessage>,
 );
 
+/// How many of Signal's requests a socket holds for its request stream:
+/// twice the chat service's window. The service has at most 256 deliveries
+/// in flight on a connection and sends another only once one is answered;
+/// its requests have no timeout (Signal-Server `WebSocketConnection.java`,
+/// `MESSAGE_SENDER_MAX_CONCURRENCY`). Besides them it sends one
+/// `PUT /api/v1/queue/empty`. Against Signal's server the stream therefore
+/// never fills, and the socket's task always reads frames: Signal's requests,
+/// the responses to the application's requests, the keepalive's answers and
+/// the server's close.
+///
+/// Only a server that exceeds its window fills the stream. The task then
+/// reads no frame of any kind until the consumer takes a request, and the
+/// connection's flow control holds the server back; the keepalive, the
+/// answers and the application's requests still go out.
+pub const REQUEST_STREAM_CAPACITY: usize = 512;
+
+/// Signal's requests on a socket, each with the sender of its answer.
+/// Dropping the sender leaves the request unanswered.
 pub struct SignalRequestStream {
-    inner: mpsc::UnboundedReceiver<RequestStreamItem>,
+    inner: mpsc::Receiver<RequestStreamItem>,
+}
+
+impl SignalRequestStream {
+    /// The next request already buffered, without waiting for one.
+    pub(crate) fn try_next_buffered(&mut self) -> Option<RequestStreamItem> {
+        self.inner.try_recv().ok()
+    }
 }
 
 impl Stream for SignalRequestStream {
@@ -51,9 +78,12 @@ impl Stream for SignalRequestStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        let inner = &mut self.inner;
-        futures::pin_mut!(inner);
-        Stream::poll_next(inner, cx)
+        self.inner.poll_next_unpin(cx)
+    }
+
+    /// At least the requests already buffered.
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
     }
 }
 
@@ -86,7 +116,8 @@ pub enum SocketEnd {
     /// A keepalive went unanswered for a whole interval, so lss closed the
     /// connection as going away (1001).
     KeepaliveUnanswered,
-    /// Every handle was dropped, and no request was in flight.
+    /// Every handle was dropped, no request was in flight, and each of
+    /// Signal's requests was answered or left unanswered.
     Released,
 }
 
@@ -99,7 +130,9 @@ impl fmt::Display for SocketEnd {
             Self::KeepaliveUnanswered => {
                 f.write_str("a keepalive went unanswered")
             },
-            Self::Released => f.write_str("every handle was dropped"),
+            Self::Released => f.write_str(
+                "every handle was dropped and no answer to Signal was pending",
+            ),
         }
     }
 }
@@ -136,7 +169,8 @@ struct SignalWebSocketProcess {
         oneshot::Sender<Result<WebSocketResponseMessage, ServiceError>>,
     )>,
     /// Signal's requests should go in here, to be delivered to the application.
-    request_sink: mpsc::UnboundedSender<RequestStreamItem>,
+    /// Bounded at [`REQUEST_STREAM_CAPACITY`].
+    request_sink: mpsc::Sender<RequestStreamItem>,
 
     outgoing_requests: HashMap<
         u64,
@@ -156,10 +190,7 @@ struct SignalWebSocketProcess {
 }
 
 impl SignalWebSocketProcess {
-    async fn process_frame(
-        &mut self,
-        frame: Bytes,
-    ) -> Result<(), ServiceError> {
+    fn process_frame(&mut self, frame: Bytes) -> Result<(), ServiceError> {
         use prost::Message;
         let msg = WebSocketMessage::decode(frame)?;
         if let Some(request) = &msg.request {
@@ -193,13 +224,23 @@ impl SignalWebSocketProcess {
             }),
             (Type::Request, Some(request), _) => {
                 let (sink, recv) = oneshot::channel();
-                tracing::trace!("sending request with body");
-                self.request_sink.send((request, sink)).await.map_err(
-                    |_| ServiceError::WsClosing {
-                        reason: "request handler failed",
+                // `next_frame` read this frame only once the stream had room
+                // for its request, or had been dropped.
+                match self.request_sink.try_send((request, sink)) {
+                    Ok(()) => self.outgoing_responses.push(recv),
+                    Err(error) => {
+                        debug_assert!(
+                            error.is_disconnected(),
+                            "a frame was read with no room for its request"
+                        );
+                        // Nothing takes Signal's requests any more. Left
+                        // unanswered, a delivery stays queued on the server,
+                        // which sends it again on a later connection.
+                        tracing::debug!(
+                            "no request stream; Signal's request left unanswered"
+                        );
                     },
-                )?;
-                self.outgoing_responses.push(recv);
+                }
 
                 Ok(())
             },
@@ -262,6 +303,27 @@ impl SignalWebSocketProcess {
                 return id;
             }
         }
+    }
+
+    /// The next event on the connection, once the request stream has room
+    /// for one more of Signal's requests: a full stream stops the reading of
+    /// frames and nothing else. A dropped stream counts as room.
+    async fn next_frame(
+        request_sink: &mut mpsc::Sender<RequestStreamItem>,
+        ws: &mut dyn WsConnection,
+    ) -> Option<Result<WsEvent, TransportError>> {
+        // An error means the stream was dropped: read on, and leave its
+        // requests unanswered.
+        let _ = future::poll_fn(|cx| request_sink.poll_ready(cx)).await;
+        ws.next().await
+    }
+
+    /// Whether the socket is released: every handle and every request of the
+    /// application is gone, and so is the responder of each of Signal's
+    /// requests, answered or dropped. An answer the application still holds
+    /// keeps the socket open, so that it reaches the server.
+    fn is_released(&self) -> bool {
+        self.requests.is_terminated() && self.outgoing_responses.is_empty()
     }
 
     /// Runs the socket until it ends, and returns why. The caller logs the
@@ -336,21 +398,24 @@ impl SignalWebSocketProcess {
                             let buffer = msg.encode_to_vec();
                             self.ws.send(Bytes::from(buffer)).await?
                         }
-                        None => {
-                            debug!("end of application request stream; websocket closing");
+                        // The branch stays off from here on.
+                        None => if self.is_released() {
+                            debug!("every handle dropped; websocket closing");
                             return Ok(SocketEnd::Released);
+                        } else {
+                            debug!("every handle dropped; waiting for the last answers to Signal");
                         }
                     }
                 }
                 // Incoming websocket message
-                web_socket_item = self.ws.next().fuse() => {
+                web_socket_item = Self::next_frame(&mut self.request_sink, &mut *self.ws).fuse() => {
                     match web_socket_item {
                         Some(Ok(WsEvent::Close { code, reason })) => {
                             tracing::debug!(%code, reason, "websocket closed");
                             return Ok(SocketEnd::Closed { code, reason });
                         },
                         Some(Ok(WsEvent::Binary(frame))) => {
-                            self.process_frame(frame).await?;
+                            self.process_frame(frame)?;
                         }
                         Some(Err(e)) => return Err(e.into()),
                         None => {
@@ -376,9 +441,16 @@ impl SignalWebSocketProcess {
                             let buffer = msg.encode_to_vec();
                             self.ws.send(Bytes::from(buffer)).await?;
                         }
-                        Err(error) => {
-                            tracing::error!(%error, "could not generate response to a Signal request; responder was canceled. continuing.");
+                        // A dropped responder answers nothing: the server
+                        // keeps a delivery queued and sends it again on a
+                        // later connection.
+                        Err(oneshot::Canceled) => {
+                            tracing::trace!("Signal's request left unanswered");
                         }
+                    }
+                    if self.is_released() {
+                        debug!("every handle dropped and Signal answered; websocket closing");
+                        return Ok(SocketEnd::Released);
                     }
                 }
             }
@@ -400,21 +472,27 @@ impl<C: WebSocketType> SignalWebSocket<C> {
     /// - [`SocketEnd::Closed`] when the server closes the connection;
     /// - [`SocketEnd::KeepaliveUnanswered`] when a keepalive goes unanswered
     ///   for a whole interval, after closing the connection with 1001;
-    /// - [`SocketEnd::Released`] once every handle is dropped and no request
-    ///   is in flight;
+    /// - [`SocketEnd::Released`] once every handle is dropped, no request is
+    ///   in flight, and each of Signal's requests passed to the request stream
+    ///   has been answered or its responder dropped (an
+    ///   [`AckHandle`](crate::messagepipe::AckHandle) still held keeps the
+    ///   socket open);
     /// - [`ServiceError::Transport`] when the connection breaks or a send on it
     ///   fails;
     /// - [`ServiceError::WsClosing`] when the connection ends without the
-    ///   server's close, or when Signal sends a request after the request
-    ///   stream was dropped, as when a
-    ///   [`MessagePipe`](crate::messagepipe::MessagePipe)'s stream is dropped
-    ///   while handles live;
+    ///   server's close;
     /// - [`ServiceError::ProtobufDecodeError`] for a frame lss cannot decode,
     ///   and [`ServiceError::InvalidFrame`] for one of an unknown type or
     ///   without the request or response its type names;
     /// - [`ServiceError::UnhandledResponseCode`] when a keepalive is answered
     ///   with a status outside 2xx, or [`ServiceError::IO`] when that status
     ///   is not a valid HTTP status.
+    ///
+    /// Signal's requests go to the request stream, which holds at most
+    /// [`REQUEST_STREAM_CAPACITY`] of them, more than Signal's server leaves
+    /// unanswered: the task reads no frame while it is full. Once the stream
+    /// is dropped, as when a [`MessagePipe`](crate::messagepipe::MessagePipe)
+    /// is, Signal's requests go unanswered.
     ///
     /// However the task ends, and if it is dropped, the connection closes and
     /// requests still waiting fail with [`ServiceError::WsClosing`].
@@ -429,9 +507,10 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             connection,
         } = upgrade;
 
-        // Create process
+        // Create process. A bounded channel holds `buffer` messages plus one
+        // for each sender, and the task holds the only sender.
         let (incoming_request_sink, incoming_request_stream) =
-            mpsc::unbounded();
+            mpsc::channel(REQUEST_STREAM_CAPACITY - 1);
         let (outgoing_request_sink, outgoing_requests) = mpsc::channel(1);
 
         let process = SignalWebSocketProcess {

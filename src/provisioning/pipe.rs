@@ -1,5 +1,4 @@
 use base64::Engine;
-use bytes::Bytes;
 use futures::{
     channel::{
         mpsc::{self, Sender},
@@ -94,8 +93,9 @@ impl ProvisioningPipe {
                 && path == Some("/v1/address".into()) =>
             {
                 // TODO: This is most likely wrong, check the SD code
-                let address: ProvisioningAddress =
-                    prost::Message::decode(Bytes::from(body.unwrap()))?;
+                let address: ProvisioningAddress = prost::Message::decode(
+                    body.ok_or(ProvisioningError::MissingUrl)?,
+                )?;
 
                 let mut provisioning_url = Url::parse("sgnl://linkdevice")
                     .map_err(|e| ProvisioningError::WsError {
@@ -132,7 +132,9 @@ impl ProvisioningPipe {
                 && path == Some("/v1/message".into()) =>
             {
                 let provision_envelope: ProvisionEnvelope =
-                    prost::Message::decode(Bytes::from(body.unwrap()))?;
+                    prost::Message::decode(
+                        body.ok_or(ProvisioningError::MissingMessage)?,
+                    )?;
                 let provision_message =
                     self.provisioning_cipher.decrypt(provision_envelope)?;
 

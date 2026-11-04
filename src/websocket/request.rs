@@ -48,7 +48,7 @@ impl WebSocketRequestMessageBuilder {
         mut self,
         value: S,
     ) -> Result<WebSocketRequestMessage, serde_json::Error> {
-        self.request.body = Some(serde_json::to_vec(&value)?);
+        self.request.body = Some(serde_json::to_vec(&value)?.into());
         Ok(self.header("content-type", "application/json").request)
     }
 

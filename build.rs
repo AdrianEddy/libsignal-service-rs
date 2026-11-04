@@ -31,6 +31,13 @@ fn main() {
     let mut prost_build = prost_build::Config::new();
     prost_build
         .default_package_filename("signal")
+        // A delivered envelope's ciphertext stays a slice of the frame it
+        // came in, from the socket to the decrypt: prost decodes a `Bytes`
+        // field from a `Bytes` buffer without copying.
+        .bytes([
+            ".signalservice.Envelope.content",
+            ".signalservice.WebSocketRequestMessage.body",
+        ])
         .compile_protos(&input, &[protobuf])
         .unwrap();
 }

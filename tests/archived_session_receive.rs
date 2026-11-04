@@ -6,23 +6,19 @@
 //! and the record is stored, so a failure after the decrypt loses the message
 //! for good. Padding must therefore never depend on the record.
 
+mod common;
+
 use std::{
     rc::Rc,
     time::{Duration, SystemTime},
 };
 
-use async_trait::async_trait;
-use futures::{future::LocalBoxFuture, lock::Mutex};
+use futures::future::LocalBoxFuture;
 use libsignal_protocol::{
-    initiate_session, kem, message_decrypt, message_encrypt, Aci,
-    CiphertextMessage, CiphertextMessageType, DeviceId, Direction,
-    GenericSignedPreKey as _, IdentityChange, IdentityKey, IdentityKeyPair,
-    IdentityKeyStore, InMemSignalProtocolStore, KeyPair, KyberPreKeyId,
-    KyberPreKeyRecord, KyberPreKeyStore, PreKeyBundle, PreKeyId, PreKeyRecord,
-    PreKeyStore, ProtocolAddress, ProtocolStore, PublicKey, SenderKeyRecord,
-    SenderKeyStore, ServiceId, SessionRecord, SessionStore,
-    SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
-    Timestamp,
+    initiate_session, message_decrypt, message_encrypt, Aci, CiphertextMessage,
+    CiphertextMessageType, DeviceId, IdentityKeyPair, PreKeyBundle,
+    ProtocolAddress, ServiceId, SessionRecord, SessionStore as _,
+    SignalProtocolError,
 };
 use libsignal_service::{
     cipher::ServiceCipher,
@@ -30,14 +26,13 @@ use libsignal_service::{
     envelope::Envelope,
     proto::{self, envelope::Type},
     push_service::ServiceError,
-    session_store::SessionStoreExt,
     transport::Clock,
 };
 use prost::Message as _;
 use rand::rng;
 use uuid::Uuid;
 
-type StoreResult<T> = Result<T, SignalProtocolError>;
+use common::store::LocalStore;
 
 /// The wall clock, for decrypts; these tests open no socket, so nothing
 /// waits on it.
@@ -53,246 +48,18 @@ impl Clock for SystemClock {
     }
 }
 
-/// `ServiceCipher` clones its store for every call, so the clones must share
-/// one state for a stored session to survive the call.
-#[derive(Clone)]
-struct SharedStore(Rc<Mutex<InMemSignalProtocolStore>>);
-
-#[async_trait(?Send)]
-impl SessionStore for SharedStore {
-    async fn load_session(
-        &self,
-        address: &ProtocolAddress,
-    ) -> StoreResult<Option<SessionRecord>> {
-        self.0.lock().await.load_session(address).await
-    }
-
-    async fn store_session(
-        &mut self,
-        address: &ProtocolAddress,
-        record: &SessionRecord,
-    ) -> StoreResult<()> {
-        self.0.lock().await.store_session(address, record).await
-    }
-}
-
-#[async_trait(?Send)]
-impl IdentityKeyStore for SharedStore {
-    async fn get_identity_key_pair(&self) -> StoreResult<IdentityKeyPair> {
-        self.0.lock().await.get_identity_key_pair().await
-    }
-
-    async fn get_local_registration_id(&self) -> StoreResult<u32> {
-        self.0.lock().await.get_local_registration_id().await
-    }
-
-    async fn save_identity(
-        &mut self,
-        address: &ProtocolAddress,
-        identity: &IdentityKey,
-    ) -> StoreResult<IdentityChange> {
-        self.0.lock().await.save_identity(address, identity).await
-    }
-
-    async fn is_trusted_identity(
-        &self,
-        address: &ProtocolAddress,
-        identity: &IdentityKey,
-        direction: Direction,
-    ) -> StoreResult<bool> {
-        self.0
-            .lock()
-            .await
-            .is_trusted_identity(address, identity, direction)
-            .await
-    }
-
-    async fn get_identity(
-        &self,
-        address: &ProtocolAddress,
-    ) -> StoreResult<Option<IdentityKey>> {
-        self.0.lock().await.get_identity(address).await
-    }
-}
-
-#[async_trait(?Send)]
-impl PreKeyStore for SharedStore {
-    async fn get_pre_key(&self, id: PreKeyId) -> StoreResult<PreKeyRecord> {
-        self.0.lock().await.get_pre_key(id).await
-    }
-
-    async fn save_pre_key(
-        &mut self,
-        id: PreKeyId,
-        record: &PreKeyRecord,
-    ) -> StoreResult<()> {
-        self.0.lock().await.save_pre_key(id, record).await
-    }
-
-    async fn remove_pre_key(&mut self, id: PreKeyId) -> StoreResult<()> {
-        self.0.lock().await.remove_pre_key(id).await
-    }
-}
-
-#[async_trait(?Send)]
-impl SignedPreKeyStore for SharedStore {
-    async fn get_signed_pre_key(
-        &self,
-        id: SignedPreKeyId,
-    ) -> StoreResult<SignedPreKeyRecord> {
-        self.0.lock().await.get_signed_pre_key(id).await
-    }
-
-    async fn save_signed_pre_key(
-        &mut self,
-        id: SignedPreKeyId,
-        record: &SignedPreKeyRecord,
-    ) -> StoreResult<()> {
-        self.0.lock().await.save_signed_pre_key(id, record).await
-    }
-}
-
-#[async_trait(?Send)]
-impl KyberPreKeyStore for SharedStore {
-    async fn get_kyber_pre_key(
-        &self,
-        id: KyberPreKeyId,
-    ) -> StoreResult<KyberPreKeyRecord> {
-        self.0.lock().await.get_kyber_pre_key(id).await
-    }
-
-    async fn save_kyber_pre_key(
-        &mut self,
-        id: KyberPreKeyId,
-        record: &KyberPreKeyRecord,
-    ) -> StoreResult<()> {
-        self.0.lock().await.save_kyber_pre_key(id, record).await
-    }
-
-    async fn mark_kyber_pre_key_used(
-        &mut self,
-        id: KyberPreKeyId,
-        signed_id: SignedPreKeyId,
-        base_key: &PublicKey,
-    ) -> StoreResult<()> {
-        self.0
-            .lock()
-            .await
-            .mark_kyber_pre_key_used(id, signed_id, base_key)
-            .await
-    }
-}
-
-#[async_trait(?Send)]
-impl SenderKeyStore for SharedStore {
-    async fn store_sender_key(
-        &mut self,
-        sender: &ProtocolAddress,
-        distribution_id: Uuid,
-        record: &SenderKeyRecord,
-    ) -> StoreResult<()> {
-        self.0
-            .lock()
-            .await
-            .store_sender_key(sender, distribution_id, record)
-            .await
-    }
-
-    async fn load_sender_key(
-        &mut self,
-        sender: &ProtocolAddress,
-        distribution_id: Uuid,
-    ) -> StoreResult<Option<SenderKeyRecord>> {
-        self.0
-            .lock()
-            .await
-            .load_sender_key(sender, distribution_id)
-            .await
-    }
-}
-
-impl ProtocolStore for SharedStore {}
-
-#[async_trait(?Send)]
-impl SessionStoreExt for SharedStore {
-    async fn get_sub_device_sessions(
-        &self,
-        _: &ServiceId,
-    ) -> StoreResult<Vec<DeviceId>> {
-        Ok(vec![])
-    }
-
-    async fn delete_session(&self, _: &ProtocolAddress) -> StoreResult<()> {
-        Ok(())
-    }
-
-    async fn delete_all_sessions(&self, _: &ServiceId) -> StoreResult<usize> {
-        Ok(0)
-    }
-}
-
 struct Peer {
     aci: Aci,
     address: ProtocolAddress,
-    store: SharedStore,
+    store: LocalStore,
     bundle: PreKeyBundle,
 }
 
 impl Peer {
     async fn new() -> Self {
-        let rng = &mut rng();
-        let identity = IdentityKeyPair::generate(rng);
-        let signed_key = KeyPair::generate(rng);
-        let kyber_key = kem::KeyPair::generate(kem::KeyType::Kyber1024, rng);
-        let signed_signature = identity
-            .private_key()
-            .calculate_signature(&signed_key.public_key.serialize(), rng)
-            .unwrap();
-        let kyber_signature = identity
-            .private_key()
-            .calculate_signature(&kyber_key.public_key.serialize(), rng)
-            .unwrap();
-
-        let mut store = InMemSignalProtocolStore::new(identity, 1).unwrap();
-        store
-            .save_signed_pre_key(
-                1.into(),
-                &SignedPreKeyRecord::new(
-                    1.into(),
-                    Timestamp::from_epoch_millis(0),
-                    &signed_key,
-                    &signed_signature,
-                ),
-            )
-            .await
-            .unwrap();
-        store
-            .save_kyber_pre_key(
-                1.into(),
-                &KyberPreKeyRecord::new(
-                    1.into(),
-                    Timestamp::from_epoch_millis(0),
-                    &kyber_key,
-                    &kyber_signature,
-                ),
-            )
-            .await
-            .unwrap();
-
+        let store = LocalStore::new(IdentityKeyPair::generate(&mut rng()), 1);
         let device = DeviceId::new(1).unwrap();
-        let bundle = PreKeyBundle::new(
-            1,
-            device,
-            None,
-            1.into(),
-            signed_key.public_key,
-            signed_signature.to_vec(),
-            1.into(),
-            kyber_key.public_key,
-            kyber_signature.to_vec(),
-            *identity.identity_key(),
-        )
-        .unwrap();
+        let bundle = store.bundle(device).await;
         let aci = Aci::from(Uuid::from_bytes(rand::random()));
         Self {
             aci,
@@ -300,7 +67,7 @@ impl Peer {
                 ServiceId::from(aci).service_id_string(),
                 device,
             ),
-            store: SharedStore(Rc::new(Mutex::new(store))),
+            store,
             bundle,
         }
     }
@@ -366,7 +133,7 @@ impl Peer {
             ),
             client_timestamp: Some(1_700_000_000_000),
             server_timestamp: Some(1_700_000_000_001),
-            content: Some(message.serialize().to_vec()),
+            content: Some(message.serialize().to_vec().into()),
             ..Default::default()
         }
     }
