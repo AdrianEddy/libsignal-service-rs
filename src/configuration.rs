@@ -9,16 +9,54 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use zkgroup::ServerPublicParams;
 
-use crate::push_service::{HttpAuth, DEFAULT_DEVICE_ID};
+use crate::{
+    push_service::{HttpAuth, DEFAULT_DEVICE_ID},
+    transport::{EndpointKind, RedactedUrl},
+};
 
+/// A Signal environment: where its services are and the keys that vouch for
+/// them.
 #[derive(Clone)]
 pub struct ServiceConfiguration {
     service_url: Url,
     storage_url: Url,
     cdn_urls: HashMap<u32, Url>,
+    /// The root the WebSocket's own TLS trusts. Empty in a configuration from
+    /// [`ServiceConfiguration::new`]; HTTP trust is the transport's.
     pub certificate_authority: String,
     pub unidentified_sender_trust_roots: Vec<PublicKey>,
     pub zkgroup_server_public_params: ServerPublicParams,
+}
+
+/// Where a Signal environment's services are.
+#[derive(Debug, Clone)]
+pub struct ServiceUrls {
+    pub chat: Url,
+    pub storage: Url,
+    /// By Signal's number for each CDN.
+    pub cdn: HashMap<u32, Url>,
+}
+
+impl ServiceConfiguration {
+    /// An environment at `urls`, for a [`Transport`] that supplies TLS trust
+    /// itself: [`certificate_authority`](Self::certificate_authority) stays
+    /// empty.
+    ///
+    /// [`Transport`]: crate::transport::Transport
+    pub fn new(
+        urls: ServiceUrls,
+        unidentified_sender_trust_roots: Vec<PublicKey>,
+        zkgroup_server_public_params: ServerPublicParams,
+    ) -> Self {
+        Self {
+            service_url: urls.chat,
+            storage_url: urls.storage,
+            cdn_urls: urls.cdn,
+            certificate_authority: String::new(),
+            unidentified_sender_trust_roots,
+            zkgroup_server_public_params,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -75,9 +113,16 @@ impl From<SignalServers> for libsignal_net::env::Env<'static> {
     }
 }
 
-#[derive(Debug)]
+/// Where a request goes. `Debug` and `Display` leave out what can carry a
+/// credential: an absolute URL's user information, query and fragment, and a
+/// CDN path's query (a resumable upload's session).
+#[derive(derive_more::Debug)]
 pub enum Endpoint<'a> {
-    Absolute(Url),
+    Absolute {
+        #[debug("{}", RedactedUrl(url))]
+        url: Url,
+        kind: EndpointKind,
+    },
     Service {
         path: Cow<'a, str>,
     },
@@ -87,6 +132,7 @@ pub enum Endpoint<'a> {
     Cdn {
         cdn_id: u32,
         path: Cow<'a, str>,
+        #[debug(ignore)]
         query: Option<Cow<'a, str>>,
     },
 }
@@ -94,7 +140,9 @@ pub enum Endpoint<'a> {
 impl fmt::Display for Endpoint<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Endpoint::Absolute(url) => write!(f, "absolute URL {url}"),
+            Endpoint::Absolute { url, .. } => {
+                write!(f, "absolute URL {}", RedactedUrl(url))
+            },
             Endpoint::Service { path } => {
                 write!(f, "service API call to {path}")
             },
@@ -109,6 +157,10 @@ impl fmt::Display for Endpoint<'_> {
 }
 
 impl<'a> Endpoint<'a> {
+    pub fn absolute(url: Url, kind: EndpointKind) -> Self {
+        Self::Absolute { url, kind }
+    }
+
     pub fn service(path: impl Into<Cow<'a, str>>) -> Self {
         Self::Service { path: path.into() }
     }
@@ -131,6 +183,15 @@ impl<'a> Endpoint<'a> {
 
     pub fn storage(path: impl Into<Cow<'a, str>>) -> Self {
         Self::Storage { path: path.into() }
+    }
+
+    pub fn kind(&self) -> EndpointKind {
+        match self {
+            Endpoint::Absolute { kind, .. } => *kind,
+            Endpoint::Service { .. } => EndpointKind::Chat,
+            Endpoint::Storage { .. } => EndpointKind::Storage,
+            Endpoint::Cdn { cdn_id, .. } => EndpointKind::Cdn(*cdn_id),
+        }
     }
 
     pub fn into_url(
@@ -159,7 +220,7 @@ impl<'a> Endpoint<'a> {
                 url.set_query(query.as_deref());
                 Ok(url)
             },
-            Endpoint::Absolute(url) => Ok(url),
+            Endpoint::Absolute { url, .. } => Ok(url),
         }
     }
 }

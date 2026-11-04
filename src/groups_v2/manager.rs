@@ -1,4 +1,4 @@
-use std::{collections::HashMap, convert::TryInto};
+use std::{collections::HashMap, convert::TryInto, rc::Rc};
 
 use crate::{
     configuration::Endpoint,
@@ -11,16 +11,17 @@ use crate::{
     push_service::{
         HttpAuth, HttpAuthOverride, ServiceIds, SignalServiceResponse,
     },
+    transport::Clock,
     utils::BASE64_RELAXED,
     websocket::{self, SignalWebSocket},
 };
 
 use base64::prelude::*;
 use bytes::Bytes;
-use chrono::{Days, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Days, NaiveDate, NaiveTime, Utc};
 use futures::AsyncReadExt;
+use http::Method;
 use rand::{CryptoRng, Rng};
-use reqwest::Method;
 use serde::Deserialize;
 use zkgroup::{
     auth::{AuthCredentialWithPni, AuthCredentialWithPniResponse},
@@ -139,6 +140,7 @@ pub struct GroupsManager<C: CredentialsCache> {
     unidentified_websocket: SignalWebSocket<websocket::Unidentified>,
     credentials_cache: C,
     server_public_params: ServerPublicParams,
+    clock: Rc<dyn Clock>,
 }
 
 impl<C: CredentialsCache> GroupsManager<C> {
@@ -148,6 +150,7 @@ impl<C: CredentialsCache> GroupsManager<C> {
         unidentified_websocket: SignalWebSocket<websocket::Unidentified>,
         credentials_cache: C,
         server_public_params: ServerPublicParams,
+        clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             service_ids,
@@ -155,6 +158,7 @@ impl<C: CredentialsCache> GroupsManager<C> {
             unidentified_websocket,
             credentials_cache,
             server_public_params,
+            clock,
         }
     }
 
@@ -163,7 +167,7 @@ impl<C: CredentialsCache> GroupsManager<C> {
         csprng: &mut R,
         group_secret_params: GroupSecretParams,
     ) -> Result<HttpAuth, ServiceError> {
-        let (today, today_plus_7_days) = current_days_seconds();
+        let (today, today_plus_7_days) = current_days_seconds(&*self.clock);
 
         let auth_credential_response = if let Some(auth_credential_response) =
             self.credentials_cache.get(&today)?
@@ -321,14 +325,14 @@ pub fn decrypt_group(
         .decrypt_group(encrypted_group)?)
 }
 
-fn current_days_seconds() -> (u64, u64) {
+fn current_days_seconds(clock: &dyn Clock) -> (u64, u64) {
     let days_seconds = |date: NaiveDate| {
         date.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap())
             .and_utc()
             .timestamp() as u64
     };
 
-    let today = Utc::now().naive_utc().date();
+    let today = DateTime::<Utc>::from(clock.now()).date_naive();
     let today_plus_7_days = today + Days::new(7);
 
     (days_seconds(today), days_seconds(today_plus_7_days))

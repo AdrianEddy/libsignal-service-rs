@@ -1,5 +1,5 @@
+use http::Method;
 use libsignal_core::DeviceId;
-use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -89,13 +89,12 @@ impl PushService {
             Endpoint::service("/v1/devices/link"),
             HttpAuthOverride::Identified(http_auth),
         )?
-        .json(&link_request)
+        .json(link_request)
         .send()
         .await?
         .service_error_for_status_with(link_device_errors)
         .await?
         .json()
         .await
-        .map_err(Into::into)
     }
 }

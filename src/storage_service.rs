@@ -32,9 +32,9 @@ use aes_gcm::{Aes256Gcm, KeyInit as _};
 use base64::Engine;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
+use http::{Method, StatusCode};
 use prost::Message;
 use rand::TryRngCore;
-use reqwest::Method;
 use serde::Deserialize;
 use sha2::Sha256;
 
@@ -44,7 +44,6 @@ use crate::proto::{
     ManifestRecord, ReadOperation, StorageItem, StorageItems, StorageManifest,
     StorageRecord,
 };
-use crate::push_service::protobuf::ProtobufResponseExt;
 use crate::push_service::SignalServiceResponse;
 use crate::push_service::{
     HttpAuth, HttpAuthOverride, PushService, ServiceError,
@@ -68,12 +67,6 @@ pub enum StorageServiceError {
 impl From<prost::DecodeError> for StorageServiceError {
     fn from(_: prost::DecodeError) -> Self {
         StorageServiceError::Invalid
-    }
-}
-
-impl From<reqwest::Error> for StorageServiceError {
-    fn from(e: reqwest::Error) -> Self {
-        StorageServiceError::Service(e.into())
     }
 }
 
@@ -167,7 +160,7 @@ impl StorageService {
             .service_error_for_status()
             .await?;
 
-        if response.status().as_u16() == 204 {
+        if response.status == StatusCode::NO_CONTENT {
             return Ok(None);
         }
         let manifest: StorageManifest = response.protobuf().await?;

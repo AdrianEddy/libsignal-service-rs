@@ -13,6 +13,7 @@ use crate::{
         error_mapper, json_or_unhandled, parse_retry_after,
         SignalServiceResponse,
     },
+    transport::Clock,
     utils::{serde_base64, TryIntoE164},
     websocket::{self, account::AccountAttributes, SignalWebSocket},
 };
@@ -148,7 +149,6 @@ impl RegistrationSessionMetadataResponse {
 async fn session_rate_limited<R>(response: R) -> ServiceError
 where
     R: SignalServiceResponse,
-    ServiceError: From<<R as SignalServiceResponse>::Error>,
 {
     let retry_after =
         response.header("retry-after").and_then(parse_retry_after);
@@ -428,6 +428,7 @@ impl SignalWebSocket<websocket::Unidentified> {
     >(
         &mut self,
         csprng: &mut R,
+        clock: &dyn Clock,
         registration_method: RegistrationMethod<'_>,
         gcm_token: Option<GcmRegistrationId<'_>>,
         account_attributes: AccountAttributes,
@@ -454,6 +455,7 @@ impl SignalWebSocket<websocket::Unidentified> {
         ) = crate::pre_keys::replenish_pre_keys(
             aci_protocol_store,
             csprng,
+            clock,
             &aci_identity_key_pair,
             true,
             0,
@@ -469,6 +471,7 @@ impl SignalWebSocket<websocket::Unidentified> {
         ) = crate::pre_keys::replenish_pre_keys(
             pni_protocol_store,
             csprng,
+            clock,
             &pni_identity_key_pair,
             true,
             0,

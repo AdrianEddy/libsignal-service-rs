@@ -187,7 +187,7 @@ impl SignalWebSocket<websocket::Unidentified> {
     pub async fn retrieve_profile_avatar(
         &mut self,
         path: &str,
-    ) -> Result<impl futures::io::AsyncRead + Send + Unpin, ServiceError> {
+    ) -> Result<impl futures::io::AsyncRead + Unpin, ServiceError> {
         Ok(self
             .unidentified_push_service
             .get_from_cdn(0, path)
@@ -198,7 +198,7 @@ impl SignalWebSocket<websocket::Unidentified> {
     pub async fn retrieve_groups_v2_profile_avatar(
         &mut self,
         path: &str,
-    ) -> Result<impl futures::io::AsyncRead + Send + Unpin, ServiceError> {
+    ) -> Result<impl futures::io::AsyncRead + Unpin, ServiceError> {
         Ok(self
             .unidentified_push_service
             .get_from_cdn(0, path)

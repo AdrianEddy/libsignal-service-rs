@@ -29,6 +29,7 @@ pub mod service_address;
 pub mod session_store;
 mod storage_service;
 mod timestamp;
+pub mod transport;
 pub mod unidentified_access;
 pub mod utils;
 pub mod websocket;

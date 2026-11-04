@@ -1,15 +1,22 @@
-use std::{sync::LazyLock, time::Duration};
+use std::{io::Write as _, rc::Rc, sync::LazyLock, time::Duration};
 
 use crate::{
-    configuration::{Endpoint, ServiceCredentials, SignalServers},
+    configuration::{Endpoint, ServiceCredentials},
     prelude::ServiceConfiguration,
+    transport::{
+        HttpBody, HttpRequest, HttpResponse, Transport, TransportError,
+        TransportErrorKind,
+    },
     utils::serde_device_id_vec,
     websocket::{SignalWebSocket, WebSocketType},
 };
 
+use base64::{prelude::BASE64_STANDARD, write::EncoderStringWriter};
+use http::{
+    header::{AUTHORIZATION, CONTENT_TYPE},
+    HeaderMap, HeaderName, HeaderValue, Method,
+};
 use libsignal_core::DeviceId;
-use protobuf::ProtobufResponseExt;
-use reqwest::{Method, RequestBuilder};
 use reqwest_websocket::Upgrade;
 use serde::{Deserialize, Serialize};
 use tracing::{debug_span, Instrument};
@@ -22,7 +29,10 @@ mod account;
 mod cdn;
 mod error;
 pub mod linking;
+mod multipart;
 pub(crate) mod response;
+#[cfg(test)]
+mod tests;
 
 pub use account::*;
 pub use cdn::*;
@@ -40,6 +50,22 @@ pub struct HttpAuth {
     pub username: String,
     #[debug(ignore)]
     pub password: String,
+}
+
+impl HttpAuth {
+    /// The `Authorization` value for basic authentication, marked sensitive.
+    fn header_value(&self) -> HeaderValue {
+        let mut value = EncoderStringWriter::from_consumer(
+            String::from("Basic "),
+            &BASE64_STANDARD,
+        );
+        write!(value, "{}:{}", self.username, self.password)
+            .expect("writing to a String");
+        let mut value = HeaderValue::try_from(value.into_inner())
+            .expect("base64 is a valid header value");
+        value.set_sensitive(true);
+        value
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,43 +100,24 @@ pub struct StaleDevices {
 
 #[derive(Clone)]
 pub struct PushService {
-    pub(crate) servers: SignalServers,
     cfg: ServiceConfiguration,
-    credentials: Option<HttpAuth>,
-    client: reqwest::Client,
+    /// The account's `Authorization` value, built once and marked sensitive.
+    authorization: Option<HeaderValue>,
+    transport: Rc<dyn Transport>,
 }
 
 impl PushService {
     pub fn new(
-        env: SignalServers,
+        cfg: ServiceConfiguration,
         credentials: Option<ServiceCredentials>,
-        user_agent: impl AsRef<str>,
+        transport: Rc<dyn Transport>,
     ) -> Self {
-        let cfg: ServiceConfiguration = env.into();
-
-        // Use the ring provider except if the application already installed one.
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        }
-
-        let client = reqwest::ClientBuilder::new()
-            .tls_certs_only([reqwest::Certificate::from_pem(
-                cfg.certificate_authority.as_bytes(),
-            )
-            .unwrap()])
-            .connect_timeout(Duration::from_secs(10))
-            // Not a total timeout: attachments take as long as they take to transfer.
-            .read_timeout(Duration::from_secs(65))
-            .user_agent(user_agent.as_ref())
-            .http1_only()
-            .build()
-            .unwrap();
-
         Self {
-            servers: env,
             cfg,
-            credentials: credentials.and_then(|c| c.authorization()),
-            client,
+            authorization: credentials
+                .and_then(|c| c.authorization())
+                .map(|auth| auth.header_value()),
+            transport,
         }
     }
 
@@ -120,27 +127,31 @@ impl PushService {
         method: Method,
         endpoint: Endpoint,
         auth_override: HttpAuthOverride,
-    ) -> Result<RequestBuilder, ServiceError> {
+    ) -> Result<RequestBuilder<'_>, ServiceError> {
+        let kind = endpoint.kind();
         let url = endpoint.into_url(&self.cfg)?;
-        let mut builder = self.client.request(method, url);
 
-        builder = match auth_override {
-            HttpAuthOverride::NoOverride => {
-                if let Some(HttpAuth { username, password }) =
-                    self.credentials.as_ref()
-                {
-                    builder.basic_auth(username, Some(password))
-                } else {
-                    builder
-                }
-            },
-            HttpAuthOverride::Identified(HttpAuth { username, password }) => {
-                builder.basic_auth(username, Some(password))
-            },
-            HttpAuthOverride::Unidentified => builder,
+        let authorization = match &auth_override {
+            HttpAuthOverride::NoOverride => self.authorization.clone(),
+            HttpAuthOverride::Identified(auth) => Some(auth.header_value()),
+            HttpAuthOverride::Unidentified => None,
         };
+        let mut headers = HeaderMap::new();
+        if let Some(authorization) = authorization {
+            headers.insert(AUTHORIZATION, authorization);
+        }
 
-        Ok(builder)
+        Ok(RequestBuilder {
+            transport: &*self.transport,
+            request: Ok(HttpRequest {
+                method,
+                url,
+                headers,
+                body: HttpBody::Empty,
+                endpoint: kind,
+                timeout: None,
+            }),
+        })
     }
 
     pub async fn ws<C: WebSocketType>(
@@ -155,7 +166,27 @@ impl PushService {
         let mut url = Endpoint::service(path).into_url(&self.cfg)?;
         url.set_scheme("wss").expect("valid https base url");
 
-        let mut builder = self.client.get(url);
+        // The WebSocket still connects through reqwest, trusting the
+        // configuration's certificate authority, until it moves onto
+        // `Transport::websocket`.
+        if rustls::crypto::CryptoProvider::get_default().is_none() {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        }
+        let client = reqwest::Certificate::from_pem(
+            self.cfg.certificate_authority.as_bytes(),
+        )
+        .and_then(|root| {
+            reqwest::ClientBuilder::new()
+                .tls_certs_only([root])
+                .connect_timeout(Duration::from_secs(10))
+                .read_timeout(Duration::from_secs(65))
+                .user_agent(crate::USER_AGENT)
+                .http1_only()
+                .build()
+        })
+        .map_err(|e| TransportError::new(TransportErrorKind::Other, e))?;
+
+        let mut builder = client.get(url);
         for (key, value) in additional_headers {
             builder = builder.header(*key, *value);
         }
@@ -174,10 +205,9 @@ impl PushService {
             .await?;
 
         let unidentified_push_service = PushService {
-            servers: self.servers,
             cfg: self.cfg.clone(),
-            credentials: None,
-            client: self.client.clone(),
+            authorization: None,
+            transport: self.transport.clone(),
         };
         let (ws, task) = SignalWebSocket::new(
             ws,
@@ -207,90 +237,88 @@ impl PushService {
     }
 }
 
-pub(crate) mod protobuf {
-    use async_trait::async_trait;
-    use prost::{EncodeError, Message};
-    use reqwest::{header, RequestBuilder, Response};
-
-    use super::ServiceError;
-
-    pub(crate) trait ProtobufRequestBuilderExt
-    where
-        Self: Sized,
-    {
-        /// Set the request payload encoded as protobuf.
-        /// Sets the `Content-Type` header to `application/x-protobuf`
-        #[allow(dead_code)]
-        fn protobuf<T: Message + Default>(
-            self,
-            value: T,
-        ) -> Result<Self, EncodeError>;
-    }
-
-    #[async_trait::async_trait]
-    pub(crate) trait ProtobufResponseExt {
-        /// Get the response body decoded from Protobuf
-        async fn protobuf<T>(self) -> Result<T, ServiceError>
-        where
-            T: prost::Message + Default;
-    }
-
-    impl ProtobufRequestBuilderExt for RequestBuilder {
-        fn protobuf<T: Message + Default>(
-            self,
-            value: T,
-        ) -> Result<Self, EncodeError> {
-            let mut buf = Vec::new();
-            value.encode(&mut buf)?;
-            let this =
-                self.header(header::CONTENT_TYPE, "application/x-protobuf");
-            Ok(this.body(buf))
-        }
-    }
-
-    #[async_trait]
-    impl ProtobufResponseExt for Response {
-        async fn protobuf<T>(self) -> Result<T, ServiceError>
-        where
-            T: Message + Default,
-        {
-            let body = self.bytes().await?;
-            let decoded = T::decode(body)?;
-            Ok(decoded)
-        }
+impl From<reqwest_websocket::Error> for ServiceError {
+    fn from(error: reqwest_websocket::Error) -> Self {
+        TransportError::new(TransportErrorKind::Other, error).into()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::configuration::SignalServers;
-    use bytes::{Buf, Bytes};
+/// A request to a Signal service, sent through the [`Transport`].
+#[must_use = "a request does nothing until it is sent"]
+pub struct RequestBuilder<'a> {
+    transport: &'a dyn Transport,
+    request: Result<HttpRequest, ServiceError>,
+}
 
-    #[test]
-    fn create_clients() {
-        let environments = &[SignalServers::Staging, SignalServers::Production];
-
-        for env in environments {
-            let _ =
-                super::PushService::new(*env, None, "libsignal-service test");
+impl RequestBuilder<'_> {
+    /// Adds a header; an invalid name or value fails [`send`](Self::send). An
+    /// `Authorization` value is marked sensitive.
+    pub fn header<K, V>(mut self, name: K, value: V) -> Self
+    where
+        HeaderName: TryFrom<K>,
+        <HeaderName as TryFrom<K>>::Error: Into<http::Error>,
+        HeaderValue: TryFrom<V>,
+        <HeaderValue as TryFrom<V>>::Error: Into<http::Error>,
+    {
+        if let Ok(request) = &mut self.request {
+            let header = HeaderName::try_from(name)
+                .map_err(Into::into)
+                .and_then(|name| {
+                    Ok((
+                        name,
+                        HeaderValue::try_from(value).map_err(Into::into)?,
+                    ))
+                });
+            match header {
+                Ok((name, mut value)) => {
+                    if name == AUTHORIZATION {
+                        value.set_sensitive(true);
+                    }
+                    request.headers.append(name, value);
+                },
+                Err(error) => {
+                    self.request = Err(ServiceError::InvalidHeader(error))
+                },
+            }
         }
+        self
     }
 
-    #[test]
-    fn serde_json_from_empty_reader() {
-        // This fails, so we have handle empty response body separately in HyperPushService::json()
-        let bytes: Bytes = "".into();
-        assert!(
-            serde_json::from_reader::<bytes::buf::Reader<Bytes>, String>(
-                bytes.reader()
-            )
-            .is_err()
-        );
+    /// Sets a JSON body and, unless one is set,
+    /// `Content-Type: application/json`.
+    pub fn json<T: Serialize + ?Sized>(mut self, value: &T) -> Self {
+        if let Ok(request) = &mut self.request {
+            match serde_json::to_vec(value) {
+                Ok(body) => {
+                    request.headers.entry(CONTENT_TYPE).or_insert(
+                        HeaderValue::from_static("application/json"),
+                    );
+                    request.body = body.into();
+                },
+                Err(error) => self.request = Err(error.into()),
+            }
+        }
+        self
     }
 
-    #[test]
-    fn serde_json_form_empty_vec() {
-        // If we're trying to send and empty payload, serde_json must be able to make a Vec out of it
-        assert!(serde_json::to_vec(b"").is_ok());
+    pub fn body(mut self, body: impl Into<HttpBody>) -> Self {
+        if let Ok(request) = &mut self.request {
+            request.body = body.into();
+        }
+        self
+    }
+
+    /// Sets how long the transport waits for the response head once the
+    /// request is sent ([`HttpRequest::timeout`]), for a request the server
+    /// holds, such as a long poll.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        if let Ok(request) = &mut self.request {
+            request.timeout = Some(timeout);
+        }
+        self
+    }
+
+    pub async fn send(self) -> Result<HttpResponse, ServiceError> {
+        Ok(self.transport.request(self.request?).await?)
     }
 }

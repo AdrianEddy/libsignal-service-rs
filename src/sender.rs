@@ -1,6 +1,5 @@
-use std::{collections::HashSet, time::SystemTime};
+use std::collections::HashSet;
 
-use chrono::prelude::*;
 use libsignal_core::{curve::CurveError, InvalidDeviceId};
 use libsignal_protocol::{
     process_prekey_bundle, Aci, DeviceId, IdentityKey, IdentityKeyPair, Pni,
@@ -28,6 +27,7 @@ use crate::{
     push_service::*,
     service_address::ServiceIdExt,
     session_store::SessionStoreExt,
+    timestamp::epoch_millis,
     unidentified_access::UnidentifiedAccess,
     utils::{serde_device_id, serde_service_id},
     websocket::{self, SignalWebSocket},
@@ -164,6 +164,7 @@ impl<S> MessageSender<S>
 where
     S: ProtocolStore + SenderKeyStore + SessionStoreExt + Sync + Clone,
 {
+    /// The sender reads the time from `cipher`'s clock.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         identified_ws: SignalWebSocket<websocket::Identified>,
@@ -194,7 +195,7 @@ where
     /// Encrypts and uploads an attachment
     ///
     /// Contents are accepted as an owned, plain text Vec, because encryption happens in-place.
-    #[tracing::instrument(skip(self, contents, csprng), fields(size = contents.len()))]
+    #[tracing::instrument(skip_all, fields(size = contents.len()))]
     pub async fn upload_attachment<R: Rng + CryptoRng>(
         &mut self,
         spec: AttachmentSpec,
@@ -282,12 +283,7 @@ where
             height: spec.height,
             caption: spec.caption,
             blur_hash: spec.blur_hash,
-            upload_timestamp: Some(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .expect("unix epoch in the past")
-                    .as_millis() as u64,
-            ),
+            upload_timestamp: Some(epoch_millis(&*self.cipher.clock)),
             cdn_number: Some(attachment_upload_form.cdn),
             attachment_identifier: Some(AttachmentIdentifier::CdnKey(
                 attachment_upload_form.key,
@@ -573,7 +569,7 @@ where
             *recipient,
             unidentified_access,
             &content_body,
-            Utc::now().timestamp_millis() as u64,
+            epoch_millis(&*self.cipher.clock),
             false,
             false,
         )
@@ -697,7 +693,7 @@ where
                             &mut self.protocol_store.clone(),
                             &mut self.protocol_store,
                             &pre_key,
-                            SystemTime::now(),
+                            self.cipher.clock.now(),
                             &mut rng,
                         )
                         .await
@@ -832,7 +828,7 @@ where
             ..SyncMessage::with_padding(&mut rng())
         };
 
-        let ts = Utc::now().timestamp_millis() as u64;
+        let ts = epoch_millis(&*self.cipher.clock);
         self.send_message(recipient, None, msg, ts, false, false)
             .await?;
 
@@ -846,7 +842,7 @@ where
     ) -> Result<(), MessageSenderError> {
         if self.is_multi_device().await {
             let content = sync.into().into();
-            let timestamp = Utc::now().timestamp_millis() as u64;
+            let timestamp = epoch_millis(&*self.cipher.clock);
             debug!(
                 "sending multi-device sync message with content {content:?}"
             );
@@ -1091,7 +1087,7 @@ where
                     &mut self.protocol_store.clone(),
                     &mut self.protocol_store,
                     &pre_key_bundle,
-                    SystemTime::now(),
+                    self.cipher.clock.now(),
                     &mut rng,
                 )
                 .await?;

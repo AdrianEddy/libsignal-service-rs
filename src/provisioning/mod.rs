@@ -35,6 +35,7 @@ use crate::{
     account_manager::encrypt_device_name,
     pre_keys::PreKeysStore,
     push_service::{HttpAuth, PushService, ServiceIds},
+    transport::Clock,
 };
 
 pub use crate::proto::{
@@ -170,6 +171,7 @@ pub struct NewDeviceRegistration {
     pub ephemeral_backup_key: Option<[u8; 32]>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn link_device<
     R: rand::Rng + rand::CryptoRng,
     Aci: PreKeysStore,
@@ -178,6 +180,7 @@ pub async fn link_device<
     aci_store: &mut Aci,
     pni_store: &mut Pni,
     csprng: &mut R,
+    clock: &dyn Clock,
     mut push_service: PushService,
     password: &str,
     device_name: &str,
@@ -293,6 +296,7 @@ pub async fn link_device<
         ) = crate::pre_keys::replenish_pre_keys(
             aci_store,
             csprng,
+            clock,
             &aci_key_pair,
             true,
             0,
@@ -313,6 +317,7 @@ pub async fn link_device<
         ) = crate::pre_keys::replenish_pre_keys(
             pni_store,
             csprng,
+            clock,
             &pni_key_pair,
             true,
             0,

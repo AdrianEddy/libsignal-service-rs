@@ -1,7 +1,8 @@
 use std::convert::TryFrom;
 
 use crate::{
-    timestamp::TimestampExt as _,
+    timestamp::epoch_millis,
+    transport::Clock,
     utils::{serde_base64, serde_identity_key},
 };
 use async_trait::async_trait;
@@ -184,9 +185,31 @@ pub(crate) const PRE_KEY_MINIMUM: u32 = 10;
 pub(crate) const PRE_KEY_BATCH_SIZE: u32 = 100;
 pub(crate) const PRE_KEY_MEDIUM_MAX_VALUE: u32 = 0xFFFFFF;
 
+/// A Kyber1024 prekey signed by `identity_key_pair`, created at `timestamp`,
+/// with its key pair and signature drawn from `csprng`.
+///
+/// libsignal's `KyberPreKeyRecord::generate` builds the same record but reads
+/// the system clock and `OsRng` itself; the official clients build it from
+/// their own clock and randomness (`KyberPreKeyRecord_New`), as this does.
+pub(crate) fn generate_kyber_pre_key<R: Rng + CryptoRng>(
+    id: KyberPreKeyId,
+    identity_key_pair: &IdentityKeyPair,
+    timestamp: Timestamp,
+    csprng: &mut R,
+) -> Result<KyberPreKeyRecord, SignalProtocolError> {
+    let key_pair = kem::KeyPair::generate(kem::KeyType::Kyber1024, csprng);
+    let signature = identity_key_pair
+        .private_key()
+        .calculate_signature(&key_pair.public_key.serialize(), csprng)?;
+    Ok(KyberPreKeyRecord::new(id, timestamp, &key_pair, &signature))
+}
+
+/// Generates and stores a batch of prekeys. Every signed and Kyber prekey of
+/// the batch carries the same creation time, read once from `clock`.
 pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
     protocol_store: &mut P,
     csprng: &mut R,
+    clock: &dyn Clock,
     identity_key_pair: &IdentityKeyPair,
     use_last_resort_key: bool,
     pre_key_count: u32,
@@ -204,6 +227,7 @@ pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
     let next_signed_pre_key_id =
         protocol_store.next_signed_pre_key_id().await?;
     let pq_pre_keys_offset_id = protocol_store.next_pq_pre_key_id().await?;
+    let now = Timestamp::from_epoch_millis(epoch_millis(clock));
 
     let span = tracing::span!(tracing::Level::DEBUG, "Generating pre keys");
 
@@ -233,11 +257,8 @@ pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
             % (PRE_KEY_MEDIUM_MAX_VALUE - 1))
             + 1)
         .into();
-        let pre_key_record = KyberPreKeyRecord::generate(
-            kem::KeyType::Kyber1024,
-            pre_key_id,
-            identity_key_pair.private_key(),
-        )?;
+        let pre_key_record =
+            generate_kyber_pre_key(pre_key_id, identity_key_pair, now, csprng)?;
         protocol_store
                     .save_kyber_pre_key(pre_key_id, &pre_key_record)
                     .instrument(tracing::trace_span!(parent: &span, "save kyber pre key", ?pre_key_id)).await?;
@@ -257,7 +278,7 @@ pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
 
     let signed_prekey_record = SignedPreKeyRecord::new(
         next_signed_pre_key_id.into(),
-        Timestamp::now(),
+        now,
         &signed_pre_key_pair,
         &signed_pre_key_signature,
     );
@@ -282,11 +303,8 @@ pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
             );
         }
 
-        let pre_key_record = KyberPreKeyRecord::generate(
-            kem::KeyType::Kyber1024,
-            pre_key_id,
-            identity_key_pair.private_key(),
-        )?;
+        let pre_key_record =
+            generate_kyber_pre_key(pre_key_id, identity_key_pair, now, csprng)?;
         protocol_store
                     .store_last_resort_kyber_pre_key(pre_key_id, &pre_key_record)
                     .instrument(tracing::trace_span!(parent: &span, "save last resort kyber pre key", ?pre_key_id)).await?;
@@ -306,3 +324,6 @@ pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
         pq_last_resort_key,
     ))
 }
+
+#[cfg(test)]
+mod tests;

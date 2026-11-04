@@ -54,6 +54,7 @@ impl SignalWebSocket<Identified> {
     /// are looked up inside an SGX enclave for privacy.
     ///
     /// # Arguments
+    /// * `env` - The CDSI environment, such as `SignalServers::Production.into()`
     /// * `lookup_request` - The CDSI lookup request containing phone numbers and other parameters
     ///
     /// # Returns
@@ -61,11 +62,10 @@ impl SignalWebSocket<Identified> {
     /// * `Err(ServiceError)` - Network or protocol error
     pub async fn discover_contacts(
         &mut self,
+        env: &libsignal_net::env::Env<'_>,
         lookup_request: LookupRequest,
     ) -> Result<Vec<(libsignal_core::E164, Option<ServiceId>)>, ServiceError>
     {
-        let env: libsignal_net::env::Env<'_> = self.servers().into();
-
         // 1. Get CDSI auth credentials from chat server
         let cdsi_auth_response = self.get_cdsi_auth().await?;
 
@@ -129,6 +129,7 @@ impl SignalWebSocket<Identified> {
     /// Convenience wrapper that looks up a single phone number using CDSI.
     ///
     /// # Arguments
+    /// * `env` - The CDSI environment, as for [`Self::discover_contacts`]
     /// * `phone_number` - Phone number in E.164 format (e.g., "+15551234567")
     ///
     /// # Returns
@@ -136,6 +137,7 @@ impl SignalWebSocket<Identified> {
     /// * `Err(ServiceError)` - Network or protocol error
     pub async fn discover_contact_by_phone_number(
         &mut self,
+        env: &libsignal_net::env::Env<'_>,
         phone_number: impl TryIntoE164,
     ) -> Result<Option<ServiceId>, ServiceError> {
         let lookup_request = LookupRequest {
@@ -145,7 +147,7 @@ impl SignalWebSocket<Identified> {
             ..Default::default()
         };
 
-        let results = self.discover_contacts(lookup_request).await?;
+        let results = self.discover_contacts(env, lookup_request).await?;
         Ok(results
             .into_iter()
             .next()

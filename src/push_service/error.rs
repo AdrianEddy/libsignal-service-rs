@@ -1,15 +1,16 @@
 use aes::cipher::block_padding;
+use http::StatusCode;
 use libsignal_core::{curve::CurveError, ServiceId};
 use libsignal_protocol::{
     FingerprintError, ServiceIdKind, SignalProtocolError,
 };
-use reqwest::StatusCode;
 use serde::Deserialize;
 use zkgroup::{ZkGroupDeserializationFailure, ZkGroupVerificationFailure};
 
 use crate::{
     cipher::SealedSenderDecryptionError,
     groups_v2::GroupDecodingError,
+    transport::TransportError,
     utils::deserialize_service_id,
     websocket::registration::{
         RegistrationLockFailure, RegistrationSessionMetadataResponse,
@@ -39,6 +40,11 @@ pub struct VerificationDeliveryFailure {
     pub reason: String,
     pub permanent_failure: bool,
 }
+
+/// The most of an error response's body lss keeps for diagnostics when the
+/// status alone is the error. A body that breaks off earlier ends there; the
+/// status stays the error.
+pub const ERROR_BODY_LIMIT: usize = 4096;
 
 #[derive(thiserror::Error, Debug)]
 pub enum ServiceError {
@@ -78,11 +84,12 @@ pub enum ServiceError {
     #[error("Registration lock is set: {0:?}")]
     Locked(RegistrationLockFailure),
 
+    /// A status lss doesn't handle, or an error body it couldn't decode.
+    /// Where the status alone is the error, `body` holds at most
+    /// [`ERROR_BODY_LIMIT`] bytes of the response's body.
     #[error("Unexpected response: HTTP {status}: {body}")]
     UnhandledResponseCode { status: StatusCode, body: String },
 
-    #[error("Websocket error: {0}")]
-    WsError(Box<reqwest_websocket::Error>),
     #[error("Websocket closing: {reason}")]
     WsClosing { reason: &'static str },
 
@@ -188,8 +195,11 @@ pub enum ServiceError {
     #[error("challenge token not accepted")]
     ChallengeNotAccepted,
 
-    #[error("HTTP reqwest error: {0}")]
-    Http(#[from] reqwest::Error),
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+
+    #[error("invalid HTTP header")]
+    InvalidHeader(#[from] http::Error),
 
     #[error(transparent)]
     Curve(#[from] CurveError),
@@ -218,11 +228,5 @@ impl From<signal_crypto::HpkeError> for ServiceError {
 impl From<FingerprintError> for ServiceError {
     fn from(value: FingerprintError) -> Self {
         ServiceError::Fingerprint(value)
-    }
-}
-
-impl From<reqwest_websocket::Error> for ServiceError {
-    fn from(error: reqwest_websocket::Error) -> Self {
-        Self::WsError(Box::new(error))
     }
 }

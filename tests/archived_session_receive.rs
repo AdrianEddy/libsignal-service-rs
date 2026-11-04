@@ -28,12 +28,21 @@ use libsignal_service::{
     proto::{self, envelope::Type},
     push_service::ServiceError,
     session_store::SessionStoreExt,
+    transport::Clock,
 };
 use prost::Message as _;
 use rand::rng;
 use uuid::Uuid;
 
 type StoreResult<T> = Result<T, SignalProtocolError>;
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
+    }
+}
 
 /// `ServiceCipher` clones its store for every call, so the clones must share
 /// one state for a stored session to survive the call.
@@ -357,9 +366,14 @@ impl Peer {
         &self,
         envelope: Envelope,
     ) -> Result<Option<Content>, ServiceError> {
-        ServiceCipher::new(self.store.clone(), vec![], self.address.clone())
-            .open_envelope(envelope, &mut rng())
-            .await
+        ServiceCipher::new(
+            self.store.clone(),
+            vec![],
+            self.address.clone(),
+            Rc::new(SystemClock),
+        )
+        .open_envelope(envelope, &mut rng())
+        .await
     }
 
     /// A plain libsignal decrypt, standing in for the peer's own client.

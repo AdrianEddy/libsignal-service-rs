@@ -1,17 +1,18 @@
 use base64::prelude::*;
+use http::Method;
 use libsignal_core::{DeviceId, E164};
 use rand::{CryptoRng, Rng};
-use reqwest::Method;
 use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
+use std::rc::Rc;
 
 use aes::cipher::{KeyIvInit, StreamCipher as _};
 use hmac::{digest::Output, KeyInit};
 use hmac::{Hmac, Mac};
 use libsignal_protocol::{
-    kem, Aci, GenericSignedPreKey, IdentityKey, IdentityKeyPair,
-    IdentityKeyStore, KeyPair, KyberPreKeyRecord, PrivateKey, ProtocolStore,
-    PublicKey, SenderKeyStore, ServiceIdKind, SignedPreKeyRecord, Timestamp,
+    Aci, GenericSignedPreKey, IdentityKey, IdentityKeyPair, IdentityKeyStore,
+    KeyPair, PrivateKey, ProtocolStore, PublicKey, SenderKeyStore,
+    ServiceIdKind, SignedPreKeyRecord, Timestamp,
 };
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -21,8 +22,8 @@ use zkgroup::profiles::ProfileKey;
 
 use crate::content::ContentBody;
 use crate::pre_keys::{
-    KyberPreKeyEntity, PreKeyEntity, PreKeysStore, SignedPreKeyEntity,
-    PRE_KEY_BATCH_SIZE, PRE_KEY_MINIMUM,
+    generate_kyber_pre_key, KyberPreKeyEntity, PreKeyEntity, PreKeysStore,
+    SignedPreKeyEntity, PRE_KEY_BATCH_SIZE, PRE_KEY_MINIMUM,
 };
 use crate::prelude::{MessageSender, MessageSenderError};
 use crate::proto::sync_message::PniChangeNumber;
@@ -35,7 +36,8 @@ use crate::push_service::{
 use crate::sender::OutgoingPushMessage;
 use crate::service_address::ServiceIdExt;
 use crate::session_store::SessionStoreExt;
-use crate::timestamp::TimestampExt as _;
+use crate::timestamp::epoch_millis;
+use crate::transport::Clock;
 use crate::utils::{random_length_padding, BASE64_RELAXED};
 use crate::websocket::account::DeviceInfo;
 use crate::websocket::keys::PreKeyStatus;
@@ -75,6 +77,7 @@ pub struct AccountManager {
     service: PushService,
     websocket: SignalWebSocket<websocket::Identified>,
     profile_key: Option<ProfileKey>,
+    clock: Rc<dyn Clock>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -99,11 +102,13 @@ impl AccountManager {
         service: PushService,
         websocket: SignalWebSocket<websocket::Identified>,
         profile_key: Option<ProfileKey>,
+        clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             service,
             websocket,
             profile_key,
+            clock,
         }
     }
 
@@ -243,6 +248,7 @@ impl AccountManager {
             crate::pre_keys::replenish_pre_keys(
                 protocol_store,
                 &mut rand::rng(),
+                &*self.clock,
                 &identity_key_pair,
                 use_last_resort_key && !has_last_resort_key,
                 PRE_KEY_BATCH_SIZE,
@@ -759,6 +765,7 @@ impl AccountManager {
                 crate::pre_keys::replenish_pre_keys(
                     pni_protocol_store,
                     csprng,
+                    &*self.clock,
                     &pni_identity_key_pair,
                     true,
                     0,
@@ -766,6 +773,8 @@ impl AccountManager {
                 )
                 .await?
             } else {
+                let now =
+                    Timestamp::from_epoch_millis(epoch_millis(&*self.clock));
                 // Generate a signed prekey
                 let signed_pre_key_pair = KeyPair::generate(csprng);
                 let signed_pre_key_public = signed_pre_key_pair.public_key;
@@ -779,16 +788,17 @@ impl AccountManager {
 
                 let signed_prekey_record = SignedPreKeyRecord::new(
                     csprng.random_range::<u32, _>(0..0xFFFFFF).into(),
-                    Timestamp::now(),
+                    now,
                     &signed_pre_key_pair,
                     &signed_pre_key_signature,
                 );
 
                 // Generate a last-resort Kyber prekey
-                let kyber_pre_key_record = KyberPreKeyRecord::generate(
-                    kem::KeyType::Kyber1024,
+                let kyber_pre_key_record = generate_kyber_pre_key(
                     csprng.random_range::<u32, _>(0..0xFFFFFF).into(),
-                    pni_identity_key_pair.private_key(),
+                    &pni_identity_key_pair,
+                    now,
+                    csprng,
                 )?;
                 (
                     vec![],

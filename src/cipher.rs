@@ -1,4 +1,4 @@
-use std::{convert::TryFrom, fmt, time::SystemTime};
+use std::{convert::TryFrom, fmt, rc::Rc};
 
 use aes::cipher::block_padding::{Iso7816, Padding};
 use base64::prelude::*;
@@ -26,6 +26,7 @@ use crate::{
     push_service::{ServiceError, DEFAULT_DEVICE_ID},
     sender::OutgoingPushMessage,
     session_store::SessionStoreExt,
+    transport::Clock,
     utils::BASE64_RELAXED,
     ServiceIdExt,
 };
@@ -38,6 +39,7 @@ pub struct ServiceCipher<S> {
     protocol_store: S,
     trust_roots: Vec<PublicKey>,
     local_address: ProtocolAddress,
+    pub(crate) clock: Rc<dyn Clock>,
 }
 
 impl<S> fmt::Debug for ServiceCipher<S> {
@@ -75,15 +77,19 @@ impl<S> ServiceCipher<S>
 where
     S: ProtocolStore + SenderKeyStore + SessionStoreExt + Clone,
 {
+    /// Encryption, and the session checks before it, read the time from
+    /// `clock`.
     pub fn new(
         protocol_store: S,
         trust_roots: Vec<PublicKey>,
         local_address: ProtocolAddress,
+        clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             protocol_store,
             trust_roots,
             local_address,
+            clock,
         }
     }
 
@@ -557,6 +563,7 @@ where
         csprng: &mut R,
     ) -> Result<OutgoingPushMessage, ServiceError> {
         let mut rng = rng();
+        let now = self.clock.now();
 
         let session_record = self
             .protocol_store
@@ -571,7 +578,7 @@ where
 
         let record_usable = session_record
             .has_usable_sender_chain(
-                SystemTime::now(),
+                now,
                 SessionUsabilityRequirements::NotStale,
             )
             .unwrap_or(false);
@@ -595,7 +602,7 @@ where
                 &padded_content,
                 &mut self.protocol_store.clone(),
                 &mut self.protocol_store,
-                SystemTime::now(),
+                now,
                 csprng,
             )
             .await?;
@@ -614,7 +621,7 @@ where
                 &self.local_address,
                 &mut self.protocol_store.clone(),
                 &mut self.protocol_store.clone(),
-                SystemTime::now(),
+                now,
                 &mut rng,
             )
             .await?;
@@ -875,3 +882,6 @@ async fn sealed_sender_decrypt_with_validated_usmc(
         message,
     })
 }
+
+#[cfg(test)]
+mod tests;
