@@ -33,11 +33,13 @@ mod multipart;
 pub(crate) mod response;
 #[cfg(test)]
 mod tests;
+mod transfer_archive;
 
 pub use account::*;
 pub use cdn::*;
 pub use error::*;
 pub(crate) use response::SignalServiceResponse;
+pub use transfer_archive::*;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ProofRequired {

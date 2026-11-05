@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 
 use super::{
     multipart, response::parse_retry_after, AttachmentUploadForm,
-    AttachmentV2UploadAttributes, PushService,
+    AttachmentV2UploadAttributes, PushService, ServiceError,
 };
 use crate::{
     configuration::{ServiceConfiguration, SignalServers},
@@ -268,6 +268,28 @@ async fn cdn3_upload_is_a_tus_upload() {
     );
     assert_eq!(header(patch, "authorization"), Some("Basic dHVz"));
     assert_eq!(&patch_body[..], &content[..]);
+}
+
+/// An upload's 429 keeps its `Retry-After`, as a download's does.
+#[tokio::test]
+async fn a_cdn_upload_keeps_a_429s_wait() {
+    let (mut service, _) = service(vec![(429, vec![("retry-after", "120")])]);
+    let url = "https://cdn2-staging.signal.org/resumable/abc"
+        .parse()
+        .unwrap();
+    let error = service
+        .upload_attachment_v4(2, &url, 4, HashMap::new(), Cursor::new(b"abcd"))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(
+            error,
+            ServiceError::RateLimitExceeded { retry_after: Some(wait) }
+                if wait == Duration::from_secs(120)
+        ),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]

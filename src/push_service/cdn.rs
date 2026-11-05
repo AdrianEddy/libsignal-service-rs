@@ -3,11 +3,13 @@ use std::{
     io::{self, Read, SeekFrom},
 };
 
-use futures::TryStreamExt;
+use bytes::Bytes;
+use futures::{stream::LocalBoxStream, TryStreamExt};
 use http::{
     header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, LOCATION, RANGE},
-    Method, StatusCode,
+    HeaderMap, Method, StatusCode,
 };
+use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde::Deserialize;
 use tracing::{debug, trace};
 use url::Url;
@@ -18,7 +20,7 @@ use crate::{
     prelude::AttachmentIdentifier,
     proto::AttachmentPointer,
     push_service::HttpAuthOverride,
-    transport::{EndpointKind, RedactedUrl},
+    transport::{EndpointKind, RedactedUrl, TransportError},
 };
 
 use super::{
@@ -73,6 +75,90 @@ pub struct AttachmentDownload<R> {
     pub content_length: Option<u64>,
 }
 
+/// A CDN download that may continue one already begun
+/// ([`PushService::get_attachment_range`]).
+#[derive(derive_more::Debug)]
+pub struct RangedDownload {
+    /// Where in the object the body starts: the byte the download asked to
+    /// continue from, or 0 when the CDN sent the whole object instead, as a
+    /// server may (RFC 9110 §14.2).
+    pub start: u64,
+    /// The object's whole length, when it is known: a whole response's
+    /// `Content-Length`, a partial one's complete length, `start` for a 416.
+    /// A whole response is complete at the body's clean end. A partial one
+    /// may end before the object does (RFC 9110 §15.3.7): the download is
+    /// complete once `start` plus the bytes received reach this length.
+    /// Without it a partial answer proves nothing, so ask again from there;
+    /// the 416 ends the download.
+    pub total_len: Option<u64>,
+    /// The body from `start` on, in the chunks the transport received them.
+    #[debug(ignore)]
+    pub body: LocalBoxStream<'static, Result<Bytes, TransportError>>,
+}
+
+/// What `encodeURIComponent` leaves alone, as Signal-Desktop encodes a CDN
+/// key into a path (`getEphemeralBackupStream`).
+const URI_COMPONENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'!')
+    .remove(b'~')
+    .remove(b'*')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')');
+
+/// A `Content-Length` that is a number; one that isn't is logged and
+/// ignored.
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    let value = headers.get(CONTENT_LENGTH)?;
+    let length = value.to_str().ok().and_then(|value| value.parse().ok());
+    if length.is_none() {
+        tracing::warn!("invalid Content-Length header");
+    }
+    length
+}
+
+/// A byte `Content-Range` (RFC 9110 §14.4).
+#[derive(Debug, PartialEq)]
+enum ContentRange {
+    /// `bytes first-last/complete`, with `complete` `None` for `*`.
+    Partial { first: u64, complete: Option<u64> },
+    /// An unsatisfied range's `bytes */complete`.
+    Unsatisfied { complete: u64 },
+}
+
+/// Parses a byte `Content-Range`; `None` if it is neither form.
+fn parse_content_range(value: &str) -> Option<ContentRange> {
+    let (unit, range) = value.split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, complete) = range.split_once('/')?;
+    let number = |digits: &str| -> Option<u64> {
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse().ok()
+    };
+    let complete = match complete {
+        "*" => None,
+        complete => Some(number(complete)?),
+    };
+    if range == "*" {
+        return Some(ContentRange::Unsatisfied {
+            complete: complete?,
+        });
+    }
+    let (first, last) = range.split_once('-')?;
+    let (first, last) = (number(first)?, number(last)?);
+    if first > last || complete.is_some_and(|complete| last >= complete) {
+        return None;
+    }
+    Some(ContentRange::Partial { first, complete })
+}
+
 // Signal-Server: controllers/AttachmentControllerV4.java:102
 // (GET /v4/attachments/form/upload)
 error_mapper! {
@@ -105,7 +191,7 @@ impl PushService {
         self.get_from_cdn(ptr.cdn_number(), &path).await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, path))]
     pub(crate) async fn get_from_cdn(
         &mut self,
         cdn_id: u32,
@@ -124,18 +210,7 @@ impl PushService {
             .await?
             .error_for_status()
             .await?;
-        let content_length = match response.headers.get(CONTENT_LENGTH) {
-            Some(value) => {
-                match value.to_str().ok().and_then(|value| value.parse().ok()) {
-                    Some(value) => Some(value),
-                    None => {
-                        tracing::warn!("invalid Content-Length header");
-                        None
-                    },
-                }
-            },
-            None => None,
-        };
+        let content_length = content_length(&response.headers);
         let response_stream =
             response.body.map_err(io::Error::from).into_async_read();
 
@@ -143,6 +218,95 @@ impl PushService {
             stream: response_stream,
             content_length,
         })
+    }
+
+    /// Downloads `key` from CDN `cdn` from byte `from` on, to continue a
+    /// download whose first `from` bytes are kept: `GET /attachments/{key}`
+    /// with `Range: bytes={from}-`, or without a range from 0, as
+    /// Signal-Desktop downloads a transfer archive
+    /// (`getEphemeralBackupStream`). The body streams in the transport's
+    /// chunks, uncopied.
+    ///
+    /// A partial answer (206) must continue at `from`, or the download is
+    /// [`ServiceError::InvalidContentRange`], and may stop before the object
+    /// does ([`RangedDownload::total_len`]); a whole one (200) starts at 0
+    /// ([`RangedDownload::start`]).
+    ///
+    /// A 416 means `from` isn't before the object's end, and the kept bytes
+    /// are a prefix of the object, so `from` is its length: the download is
+    /// complete, an empty body at `from`. The 416's `Content-Range` is only a
+    /// SHOULD (RFC 9110 §15.5.17), and CDN3 sends none on a cache miss. One
+    /// that gives another length, or can't be read, is the CDN's status.
+    ///
+    /// A 429 is [`ServiceError::RateLimitExceeded`]. Any other status is
+    /// [`ServiceError::UnhandledResponseCode`]: 404 once the CDN no longer
+    /// has the object.
+    #[tracing::instrument(skip(self, key))]
+    pub async fn get_attachment_range(
+        &mut self,
+        cdn: u32,
+        key: &str,
+        from: u64,
+    ) -> Result<RangedDownload, ServiceError> {
+        let path =
+            format!("/attachments/{}", utf8_percent_encode(key, URI_COMPONENT));
+        let mut request = self.request(
+            Method::GET,
+            Endpoint::cdn(cdn, path),
+            HttpAuthOverride::Unidentified,
+        )?;
+        if from > 0 {
+            request = request.header(RANGE, format!("bytes={from}-"));
+        }
+        let response = request.send().await?;
+        let content_range = || {
+            response
+                .headers
+                .get(CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_content_range)
+        };
+        match response.status {
+            StatusCode::OK => Ok(RangedDownload {
+                start: 0,
+                total_len: content_length(&response.headers),
+                body: response.body,
+            }),
+            StatusCode::PARTIAL_CONTENT => match content_range() {
+                Some(ContentRange::Partial { first, complete })
+                    if first == from =>
+                {
+                    Ok(RangedDownload {
+                        start: from,
+                        total_len: complete,
+                        body: response.body,
+                    })
+                },
+                _ => Err(ServiceError::InvalidContentRange {
+                    from,
+                    content_range: response.headers.get(CONTENT_RANGE).map(
+                        |value| {
+                            String::from_utf8_lossy(value.as_bytes())
+                                .into_owned()
+                        },
+                    ),
+                }),
+            },
+            StatusCode::RANGE_NOT_SATISFIABLE
+                if !response.headers.contains_key(CONTENT_RANGE)
+                    || content_range()
+                        == Some(ContentRange::Unsatisfied {
+                            complete: from,
+                        }) =>
+            {
+                Ok(RangedDownload {
+                    start: from,
+                    total_len: Some(from),
+                    body: Box::pin(futures::stream::empty()),
+                })
+            },
+            _ => Err(response.status_error().await),
+        }
     }
 
     pub(crate) async fn get_attachment_v4_upload_attributes(

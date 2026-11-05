@@ -669,11 +669,8 @@ fn an_upload_location_is_logged_without_its_credential() {
     );
 
     let resumable = Endpoint::cdn_url(2, &location);
-    assert_eq!(resumable.to_string(), "CDN2 call to /upload/abc");
-    assert_eq!(
-        format!("{resumable:?}"),
-        "Cdn { cdn_id: 2, path: \"/upload/abc\", .. }"
-    );
+    assert_eq!(resumable.to_string(), "CDN2 call");
+    assert_eq!(format!("{resumable:?}"), "Cdn { cdn_id: 2, .. }");
 }
 
 // WebSockets.

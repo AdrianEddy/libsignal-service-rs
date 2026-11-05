@@ -112,8 +112,9 @@ impl From<SignalServers> for libsignal_net::env::Env<'static> {
 }
 
 /// Where a request goes. `Debug` and `Display` leave out what can carry a
-/// credential: an absolute URL's user information, query and fragment, and a
-/// CDN path's query (a resumable upload's session).
+/// credential: an absolute URL's user information, query and fragment; a CDN
+/// path, which names an object anyone holding it can fetch, and its query, a
+/// resumable upload's session.
 #[derive(derive_more::Debug)]
 pub enum Endpoint<'a> {
     Absolute {
@@ -129,6 +130,7 @@ pub enum Endpoint<'a> {
     },
     Cdn {
         cdn_id: u32,
+        #[debug(ignore)]
         path: Cow<'a, str>,
         #[debug(ignore)]
         query: Option<Cow<'a, str>>,
@@ -147,9 +149,7 @@ impl fmt::Display for Endpoint<'_> {
             Endpoint::Storage { path } => {
                 write!(f, "storage API call to {path}")
             },
-            Endpoint::Cdn { cdn_id, path, .. } => {
-                write!(f, "CDN{cdn_id} call to {path}")
-            },
+            Endpoint::Cdn { cdn_id, .. } => write!(f, "CDN{cdn_id} call"),
         }
     }
 }

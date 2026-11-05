@@ -37,6 +37,7 @@ hex = "0.4"
 hkdf = "0.13"
 hmac = "0.13"
 http = "1"
+percent-encoding = "2.3"
 phonenumber = { version = "0.3", optional = true }
 prost = "0.14"
 rand = "0.9"

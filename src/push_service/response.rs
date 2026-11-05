@@ -275,16 +275,31 @@ impl HttpResponse {
     }
 
     /// Fails on a 4xx or 5xx status, for services whose codes carry no
-    /// Signal meaning, such as the CDNs. The status is the error; the start
-    /// of the body rides along (see
-    /// [`error_body`](SignalServiceResponse::error_body)).
+    /// Signal meaning, such as the CDNs ([`status_error`](Self::status_error)).
     pub(crate) async fn error_for_status(self) -> Result<Self, ServiceError> {
-        let status = self.status;
-        if status.is_client_error() || status.is_server_error() {
-            let body = self.error_body().await;
-            return Err(ServiceError::UnhandledResponseCode { status, body });
+        if self.status.is_client_error() || self.status.is_server_error() {
+            return Err(self.status_error().await);
         }
         Ok(self)
+    }
+
+    /// The error of a status from such a service. A 429 is HTTP's own rate
+    /// limit (RFC 6585 §4), with its `Retry-After`. Any other status is the
+    /// error itself, a 413 too, which is a rate limit only on Signal's chat
+    /// service; the start of the body rides along (see
+    /// [`error_body`](SignalServiceResponse::error_body)).
+    pub(crate) async fn status_error(self) -> ServiceError {
+        match self.status {
+            StatusCode::TOO_MANY_REQUESTS => ServiceError::RateLimitExceeded {
+                retry_after: self
+                    .header("retry-after")
+                    .and_then(parse_retry_after),
+            },
+            status => ServiceError::UnhandledResponseCode {
+                status,
+                body: self.error_body().await,
+            },
+        }
     }
 }
 

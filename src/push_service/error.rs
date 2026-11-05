@@ -163,6 +163,19 @@ pub enum ServiceError {
     #[error("Unknown CDN version {0}")]
     UnknownCdnVersion(u32),
 
+    /// A CDN's partial response that doesn't continue a download at `from`:
+    /// its `Content-Range` is missing, unreadable or starts elsewhere.
+    #[error("a CDN's partial response from byte {from} has Content-Range {content_range:?}")]
+    InvalidContentRange {
+        from: u64,
+        content_range: Option<String>,
+    },
+
+    /// The server refused the transfer archive wait's `timeout` (400), which
+    /// it takes from 1 to 3600 seconds.
+    #[error("the server refused the transfer archive wait's timeout")]
+    InvalidTransferArchiveTimeout,
+
     #[error("Device limit reached: {current} out of {max} devices.")]
     DeviceLimitReached { current: u32, max: u32 },
 
