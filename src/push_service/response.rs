@@ -1,4 +1,4 @@
-use std::{error::Error, future::Future};
+use std::{error::Error, future::Future, time::Duration};
 
 use bytes::{Bytes, BytesMut};
 use futures::TryStreamExt;
@@ -27,12 +27,21 @@ where
     })
 }
 
-pub(crate) fn parse_retry_after(header: &str) -> Option<chrono::Duration> {
-    let val = header.parse::<i64>().inspect_err(
-        |error| tracing::warn!(%error, "could not parse rate limit duration"),
-    ).ok()?;
-
-    Some(chrono::Duration::seconds(val))
+/// A `Retry-After` value as the wait it asks for: `delay-seconds`, a decimal
+/// integer of seconds, the form Signal's services send (RFC 9110 §10.2.3).
+/// Surrounding spaces and tabs are ignored; anything else, a sign, a fraction
+/// or an HTTP-date, is `None`. A delay past `u64::MAX` seconds saturates, as
+/// RFC 9111 §1.2.2 asks of an unrepresentable delta, so parsing can't panic
+/// on any value a server sends; the caller caps a wait where it applies it,
+/// since one this long overflows an `Instant`.
+pub(crate) fn parse_retry_after(header: &str) -> Option<Duration> {
+    let value = header.trim_matches([' ', '\t']);
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        tracing::warn!(value, "could not parse rate limit duration");
+        return None;
+    }
+    // The digits leave overflow as the one error `parse` can still return.
+    Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)))
 }
 
 /// Baseline HTTP→[`ServiceError`] mapping for responses that do not need

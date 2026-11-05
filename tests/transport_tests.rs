@@ -469,7 +469,7 @@ async fn status_codes_map_to_service_errors() {
     assert!(matches!(
         service.link_device(&link_request(), link_auth()).await,
         Err(ServiceError::RateLimitExceeded { retry_after: Some(d) })
-            if d == chrono::Duration::seconds(30)
+            if d == Duration::from_secs(30)
     ));
 
     transport.answer(Answer::status(401));

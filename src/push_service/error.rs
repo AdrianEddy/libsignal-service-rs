@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use aes::cipher::block_padding;
 use http::StatusCode;
 use libsignal_core::{curve::CurveError, ServiceId};
@@ -75,9 +77,11 @@ pub enum ServiceError {
     #[error("error decoding base64 string: {0}")]
     Base64DecodeError(#[from] base64::DecodeError),
 
-    #[error("Rate limit exceeded: retry after {}", retry_after.map(|a| a.to_string()).unwrap_or_else(|| "unspecified".into()))]
+    #[error("Rate limit exceeded: retry after {}", retry_after.map(|a| format!("{a:?}")).unwrap_or_else(|| "unspecified".into()))]
     RateLimitExceeded {
-        retry_after: Option<chrono::Duration>,
+        /// The server's `Retry-After`, saturated at `u64::MAX` seconds: a
+        /// caller caps it where it holds requests back.
+        retry_after: Option<Duration>,
     },
     #[error("Authorization failed")]
     Unauthorized,
@@ -180,7 +184,7 @@ pub enum ServiceError {
     #[error("verification session rate limited: {session:?}")]
     VerificationSessionRateLimited {
         session: RegistrationSessionMetadataResponse,
-        retry_after: Option<chrono::Duration>,
+        retry_after: Option<Duration>,
     },
     #[error("verification transport not allowed: {0:?}")]
     InvalidTransportMode(RegistrationSessionMetadataResponse),

@@ -3,6 +3,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::Cursor,
     rc::Rc,
+    time::Duration,
 };
 
 use bytes::{Buf, Bytes};
@@ -11,7 +12,8 @@ use http::{header::AUTHORIZATION, HeaderMap, Method, StatusCode};
 use sha2::{Digest, Sha256};
 
 use super::{
-    multipart, AttachmentUploadForm, AttachmentV2UploadAttributes, PushService,
+    multipart, response::parse_retry_after, AttachmentUploadForm,
+    AttachmentV2UploadAttributes, PushService,
 };
 use crate::{
     configuration::{ServiceConfiguration, SignalServers},
@@ -45,6 +47,33 @@ fn serde_json_from_empty_reader() {
 fn serde_json_form_empty_vec() {
     // If we're trying to send and empty payload, serde_json must be able to make a Vec out of it
     assert!(serde_json::to_vec(b"").is_ok());
+}
+
+/// A server's `Retry-After` is `delay-seconds` or nothing: no value panics,
+/// and a delay too long for a `Duration` saturates (RFC 9111 §1.2.2). chrono's
+/// `Duration::seconds` panicked from 2^63 / 1000 seconds on.
+#[test]
+fn retry_after_is_whole_seconds_and_saturates() {
+    for (header, wait) in [
+        ("30", Some(Duration::from_secs(30))),
+        (" \t0 ", Some(Duration::ZERO)),
+        (
+            "9300000000000000",
+            Some(Duration::from_secs(9_300_000_000_000_000)),
+        ),
+        ("18446744073709551615", Some(Duration::from_secs(u64::MAX))),
+        (
+            "99999999999999999999999999",
+            Some(Duration::from_secs(u64::MAX)),
+        ),
+        ("", None),
+        ("-5", None),
+        ("+5", None),
+        ("1.5", None),
+        ("Wed, 21 Oct 2015 07:28:00 GMT", None),
+    ] {
+        assert_eq!(parse_retry_after(header), wait, "{header:?}");
+    }
 }
 
 /// A status and headers, with an empty body.
