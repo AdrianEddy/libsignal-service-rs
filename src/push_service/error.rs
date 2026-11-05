@@ -85,6 +85,10 @@ pub enum ServiceError {
     },
     #[error("Authorization failed")]
     Unauthorized,
+    /// Credentials that can't authenticate: no password, or neither an ACI
+    /// nor a phone number to log in with.
+    #[error("credentials without a login or a password")]
+    MissingCredentials,
     #[error("Registration lock is set: {0:?}")]
     Locked(RegistrationLockFailure),
 
@@ -133,6 +137,11 @@ pub enum ServiceError {
     #[error("groups v2 (zero-knowledge) error")]
     GroupsV2Error,
 
+    /// Group credentials for an account without a phone number are received
+    /// with its auth credential salt, which `GroupsManager` doesn't take.
+    #[error("no group credentials for an account without a PNI")]
+    GroupCredentialsWithoutPni,
+
     #[error(transparent)]
     GroupsV2DecryptionError(#[from] GroupDecodingError),
 
@@ -173,6 +182,13 @@ pub enum ServiceError {
     InvalidDeviceVerificationCode,
     #[error("device capabilities are a downgrade")]
     DeviceCapabilityDowngrade,
+    /// The server found the link request invalid (422): a prekey signature
+    /// that doesn't verify, PNI keys on an account without a PNI or missing
+    /// on one with it, no capabilities, or a body that fails validation. A
+    /// bug in the request, never the user's doing. `body` holds at most
+    /// [`ERROR_BODY_LIMIT`] bytes of what the server said, often nothing.
+    #[error("the server found the link request invalid: {body}")]
+    InvalidLinkRequest { body: String },
     #[error("no such verification session")]
     NoSuchSession,
     #[error("invalid or malformed verification session id")]

@@ -2,6 +2,7 @@ mod cipher;
 mod pipe;
 
 use std::array::TryFromSliceError;
+use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::pin::pin;
 use std::rc::Rc;
@@ -25,15 +26,15 @@ use url::Url;
 use uuid::Uuid;
 use zkgroup::profiles::ProfileKey;
 
-use pipe::{ProvisioningPipe, ProvisioningStep};
+pub use pipe::{ProvisioningPipe, ProvisioningStep};
 
 use crate::messagepipe::ServiceCredentials;
 use crate::prelude::ServiceError;
 use crate::push_service::linking::{
-    LinkAccountAttributes, LinkCapabilities, LinkRequest, LinkResponse,
+    LinkAccountAttributes, LinkRequest, LinkResponse,
 };
 use crate::utils::BASE64_RELAXED;
-use crate::websocket::registration::DeviceActivationRequest;
+use crate::websocket::registration::{DeviceActivationRequest, PniPreKeys};
 use crate::{
     account_manager::encrypt_device_name,
     pre_keys::PreKeysStore,
@@ -51,6 +52,9 @@ pub struct ProvisioningSecrets {
     pub ephemeral_backup_key: Option<[u8; 32]>,
     pub account_entropy_pool: AccountEntropyPool,
     pub media_root_backup_key: Option<[u8; 32]>,
+    /// The account's auth credential salt, which an account without a phone
+    /// number has and a device linked to it needs for group credentials.
+    pub auth_credential_salt: Option<[u8; 16]>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -69,6 +73,21 @@ pub enum ProvisioningError {
     InvalidPrivateKey(InvalidKeyError),
     #[error("missing UUID")]
     MissingUuid,
+    #[error("missing ACI")]
+    MissingAci,
+    #[error("invalid ACI: {0}")]
+    InvalidAci(uuid::Error),
+    #[error("invalid PNI: {0}")]
+    InvalidPni(uuid::Error),
+    /// A provisioning message with a PNI private key but no PNI, which
+    /// Signal-Desktop refuses too (`ProvisioningCipher.node.ts`).
+    #[error("PNI identity key without a PNI")]
+    PniKeyWithoutPni,
+    /// A provisioning message without a PNI, so for an account without a
+    /// phone number, that lacks the salt such an account's group credentials
+    /// need.
+    #[error("missing auth credential salt")]
+    MissingAuthCredentialSalt,
     #[error("no provisioning message received")]
     MissingMessage,
     #[error("missing profile key")]
@@ -113,6 +132,12 @@ pub enum ProvisioningError {
     InvalidAccountEntropyPool(#[from] InvalidAccountEntropyPool),
     #[error("invalid ephemeral backup key length: expected 32 bytes, got {0}")]
     InvalidEphemeralBackupKey(usize),
+    #[error("invalid auth credential salt length: expected 16 bytes, got {0}")]
+    InvalidAuthCredentialSalt(usize),
+    /// The server's answer to a link request names another account than the
+    /// provisioning message ([`ProvisionedAccount::check_link_response`]).
+    #[error("the link response is for another account than the message")]
+    MismatchedLinkResponse,
 }
 
 impl ProvisioningError {
@@ -155,19 +180,22 @@ pub enum SecondaryDeviceProvisioning {
     NewDeviceRegistration(NewDeviceRegistration),
 }
 
+/// A linked device's registration. The phone number, PNI and its keys are
+/// `None` for an account without a phone number, which has
+/// `auth_credential_salt` instead.
 #[derive(derive_more::Debug)]
 pub struct NewDeviceRegistration {
-    pub phone_number: libsignal_core::E164,
+    pub phone_number: Option<E164>,
     pub device_id: DeviceId,
     pub registration_id: u32,
-    pub pni_registration_id: u32,
+    pub pni_registration_id: Option<u32>,
     pub service_ids: ServiceIds,
     #[debug(ignore)]
     pub aci_private_key: PrivateKey,
     pub aci_public_key: IdentityKey,
     #[debug(ignore)]
-    pub pni_private_key: PrivateKey,
-    pub pni_public_key: IdentityKey,
+    pub pni_private_key: Option<PrivateKey>,
+    pub pni_public_key: Option<IdentityKey>,
     #[debug(ignore)]
     pub profile_key: ProfileKey,
     /// Account Entropy Pool — the modern `accountEntropyPool` field 15.
@@ -179,6 +207,10 @@ pub struct NewDeviceRegistration {
     /// One-time key for an initial linked-device message-history transfer.
     #[debug(ignore)]
     pub ephemeral_backup_key: Option<[u8; 32]>,
+    /// The salt group credentials need on an account without a phone number
+    /// (`AuthCredentialWithPniResponse::receive_without_pni`).
+    #[debug(ignore)]
+    pub auth_credential_salt: Option<[u8; 16]>,
 }
 
 /// Links this device to an account: opens the provisioning socket, sends its
@@ -187,6 +219,15 @@ pub struct NewDeviceRegistration {
 /// `clock`, and ends with them. If the socket ends before the steps that need
 /// it, the error is why it ended: [`ProvisioningError::SocketEnded`], or the
 /// socket's failure as a [`ProvisioningError::ServiceError`].
+///
+/// The link carries `link_capabilities` (see [`ProvisioningPipe::from_socket`]).
+/// `capabilities` is the device's capability record for the server
+/// ([`LinkAccountAttributes::capabilities`]); the link sets its
+/// `optionalPhoneNumber` to whether the account has no phone number, which
+/// the server requires of a device on such an account. An account without a
+/// phone number, one whose provisioning message has no PNI, links without
+/// PNI keys, and its registration carries the auth credential salt instead
+/// (Signal-Desktop `Provisioner.preload.ts`).
 #[allow(clippy::too_many_arguments)]
 pub async fn link_device<
     R: rand::Rng + rand::CryptoRng,
@@ -200,6 +241,8 @@ pub async fn link_device<
     push_service: PushService,
     password: &str,
     device_name: &str,
+    link_capabilities: &[&str],
+    capabilities: BTreeMap<String, bool>,
     tx: Sender<SecondaryDeviceProvisioning>,
 ) -> Result<(), ProvisioningError> {
     // open a websocket without authentication, to receive a tsurl://
@@ -226,6 +269,8 @@ pub async fn link_device<
         push_service,
         password,
         device_name,
+        link_capabilities,
+        capabilities,
         tx,
     ));
     match future::select(pin!(socket), steps).await {
@@ -260,12 +305,14 @@ async fn link_steps<
     mut push_service: PushService,
     password: &str,
     device_name: &str,
+    link_capabilities: &[&str],
+    mut capabilities: BTreeMap<String, bool>,
     mut tx: Sender<SecondaryDeviceProvisioning>,
 ) -> Result<(), ProvisioningError> {
-    let registration_id = csprng.random_range(1..256);
-    let pni_registration_id = csprng.random_range(1..256);
+    let registration_id = generate_registration_id(csprng);
 
-    let provisioning_pipe = ProvisioningPipe::from_socket(ws, csprng);
+    let provisioning_pipe =
+        ProvisioningPipe::from_socket(ws, csprng, link_capabilities);
     let provision_stream = provisioning_pipe.stream();
     pin_mut!(provision_stream);
 
@@ -287,43 +334,284 @@ async fn link_steps<
             .await
             .ok_or(ProvisioningError::MissingMessage)??
     {
-        let aci_public_key = PublicKey::deserialize(
-            &message
-                .aci_identity_key_public
-                .ok_or(ProvisioningError::MissingPublicKey)?,
-        )
-        .map_err(ProvisioningError::invalid_public_key)?;
-        let aci_public_key = IdentityKey::new(aci_public_key);
+        let account = ProvisionedAccount::try_from(message)?;
 
-        let aci_private_key = PrivateKey::deserialize(
-            &message
-                .aci_identity_key_private
-                .ok_or(ProvisioningError::MissingPrivateKey)?,
+        let (
+            _aci_pre_keys,
+            aci_signed_pre_key,
+            _aci_pq_pre_keys,
+            aci_pq_last_resort_pre_key,
+        ) = crate::pre_keys::replenish_pre_keys(
+            aci_store,
+            csprng,
+            clock,
+            &account.aci_key_pair,
+            true,
+            0,
+            0,
         )
-        .map_err(ProvisioningError::invalid_private_key)?;
+        .await?;
 
-        let pni_public_key = PublicKey::deserialize(
-            &message
-                .pni_identity_key_public
-                .ok_or(ProvisioningError::MissingPublicKey)?,
-        )
-        .map_err(ProvisioningError::invalid_public_key)?;
-        let pni_public_key = IdentityKey::new(pni_public_key);
+        let aci_pq_last_resort_pre_key =
+            aci_pq_last_resort_pre_key.expect("requested last resort key");
+        assert!(_aci_pre_keys.is_empty());
+        assert!(_aci_pq_pre_keys.is_empty());
 
-        let pni_private_key = PrivateKey::deserialize(
-            &message
-                .pni_identity_key_private
-                .ok_or(ProvisioningError::MissingPrivateKey)?,
-        )
-        .map_err(ProvisioningError::invalid_private_key)?;
+        // The PNI's registration id and prekeys, for an account with a phone
+        // number only. The id goes in the attributes and the keys beside
+        // them, so no wire type can hold them together.
+        let pni_keys = match &account.phone_number_identity {
+            Some(identity) => {
+                let (
+                    _pni_pre_keys,
+                    signed_pre_key,
+                    _pni_pq_pre_keys,
+                    pq_last_resort_pre_key,
+                ) = crate::pre_keys::replenish_pre_keys(
+                    pni_store,
+                    csprng,
+                    clock,
+                    &identity.key_pair,
+                    true,
+                    0,
+                    0,
+                )
+                .await?;
 
-        let profile_key = message
-            .profile_key
-            .ok_or(ProvisioningError::MissingProfileKey)?;
+                let pq_last_resort_pre_key =
+                    pq_last_resort_pre_key.expect("requested last resort key");
+                assert!(_pni_pre_keys.is_empty());
+                assert!(_pni_pq_pre_keys.is_empty());
+                Some((
+                    generate_registration_id(csprng),
+                    PniPreKeys {
+                        pni_signed_pre_key: signed_pre_key.try_into()?,
+                        pni_pq_last_resort_pre_key: pq_last_resort_pre_key
+                            .try_into()?,
+                    },
+                ))
+            },
+            None => None,
+        };
+        let (pni_registration_id, pni) = pni_keys.unzip();
+
+        let encrypted_device_name = BASE64_RELAXED.encode(
+            encrypt_device_name(
+                csprng,
+                device_name,
+                account.aci_key_pair.identity_key(),
+            )?
+            .encode_to_vec(),
+        );
+
+        // Signal-Desktop `getCapabilities.std.ts`: `optionalPhoneNumber` says
+        // whether the account has no phone number.
+        capabilities.insert(
+            "optionalPhoneNumber".to_owned(),
+            account.phone_number_identity.is_none(),
+        );
+        let request = LinkRequest {
+            verification_code: account.provisioning_code.clone(),
+            account_attributes: LinkAccountAttributes {
+                registration_id,
+                pni_registration_id,
+                fetches_messages: true,
+                capabilities,
+                name: encrypted_device_name,
+            },
+            device_activation_request: DeviceActivationRequest {
+                aci_signed_pre_key: aci_signed_pre_key.try_into()?,
+                aci_pq_last_resort_pre_key: aci_pq_last_resort_pre_key
+                    .try_into()?,
+                pni,
+            },
+        };
+
+        // The server reads only the password; the user name is the bare ACI
+        // for every account, as Signal-Desktop sends it (`WebAPI.preload.ts`
+        // `linkDevice`).
+        let response = push_service
+            .link_device(
+                &request,
+                HttpAuth {
+                    username: account.aci.to_string(),
+                    password: password.to_owned(),
+                },
+            )
+            .await?;
+        account.check_link_response(&response)?;
+
+        let service_ids = account.service_ids();
+        let (phone_number, pni_key_pair) = account
+            .phone_number_identity
+            .map(|identity| (identity.phone_number, identity.key_pair))
+            .unzip();
+        tx.send(SecondaryDeviceProvisioning::NewDeviceRegistration(
+            NewDeviceRegistration {
+                phone_number,
+                service_ids,
+                device_id: response.device_id,
+                registration_id,
+                pni_registration_id,
+                aci_private_key: *account.aci_key_pair.private_key(),
+                aci_public_key: *account.aci_key_pair.identity_key(),
+                pni_private_key: pni_key_pair
+                    .as_ref()
+                    .map(|pair| *pair.private_key()),
+                pni_public_key: pni_key_pair
+                    .as_ref()
+                    .map(|pair| *pair.identity_key()),
+                profile_key: account.profile_key,
+                account_entropy_pool: account.account_entropy_pool,
+                ephemeral_backup_key: account.ephemeral_backup_key,
+                auth_credential_salt: account.auth_credential_salt,
+            },
+        ))
+        .await
+        .expect("failed to send provisioning message in rx channel");
+    } else {
+        return Err(ProvisioningError::InvalidStep);
+    }
+
+    Ok(())
+}
+
+/// What an account with a phone number has and one without lacks: the PNI, the
+/// number and the PNI's identity.
+#[derive(derive_more::Debug)]
+pub struct PhoneNumberIdentity {
+    pub pni: Uuid,
+    #[debug(ignore)]
+    pub phone_number: E164,
+    #[debug(ignore)]
+    pub key_pair: IdentityKeyPair,
+}
+
+/// The account a primary device's [`ProvisionMessage`] describes, read and
+/// checked. [`ProvisioningStep::Message`] hands the message over raw: a client
+/// that drives the link's steps itself reads it with this `TryFrom`, before it
+/// makes any prekey, and passes the server's answer to
+/// [`check_link_response`](Self::check_link_response), as [`link_device`] does.
+///
+/// An account without a phone number is one whose message has no PNI: it has
+/// no phone number or PNI identity, a PNI private key in such a message is
+/// refused, and the salt is required (Signal-Desktop
+/// `ProvisioningCipher.node.ts`, `Provisioner.preload.ts`).
+#[derive(derive_more::Debug)]
+pub struct ProvisionedAccount {
+    pub aci: Uuid,
+    #[debug(ignore)]
+    pub aci_key_pair: IdentityKeyPair,
+    /// `None` for an account without a phone number.
+    pub phone_number_identity: Option<PhoneNumberIdentity>,
+    /// Required on an account without a phone number.
+    #[debug(ignore)]
+    pub auth_credential_salt: Option<[u8; 16]>,
+    #[debug(ignore)]
+    pub profile_key: ProfileKey,
+    #[debug(ignore)]
+    pub account_entropy_pool: Option<AccountEntropyPool>,
+    #[debug(ignore)]
+    pub ephemeral_backup_key: Option<[u8; 32]>,
+    #[debug(ignore)]
+    pub provisioning_code: String,
+}
+
+impl ProvisionedAccount {
+    /// The account's ids, as its message gives them.
+    pub fn service_ids(&self) -> ServiceIds {
+        ServiceIds {
+            aci: self.aci,
+            pni: self
+                .phone_number_identity
+                .as_ref()
+                .map(|identity| identity.pni),
+        }
+    }
+
+    /// Checks the server's answer to this account's link request: it must name
+    /// the account in the message, the PNI's absence included, since the keys
+    /// and the phone number come from the message (Signal-Desktop
+    /// `AccountManager.preload.ts`). After an error the new device stays on
+    /// the account, unused, and nothing of this link should be kept.
+    pub fn check_link_response(
+        &self,
+        response: &LinkResponse,
+    ) -> Result<(), ProvisioningError> {
+        let ServiceIds { aci, pni } = self.service_ids();
+        if response.aci == aci && response.pni == pni {
+            Ok(())
+        } else {
+            Err(ProvisioningError::MismatchedLinkResponse)
+        }
+    }
+}
+
+impl TryFrom<ProvisionMessage> for ProvisionedAccount {
+    type Error = ProvisioningError;
+
+    fn try_from(message: ProvisionMessage) -> Result<Self, Self::Error> {
+        let aci = provisioned_id(&message.aci_binary, &message.aci)
+            .map_err(ProvisioningError::InvalidAci)?
+            .ok_or(ProvisioningError::MissingAci)?;
+        let pni = provisioned_id(&message.pni_binary, &message.pni)
+            .map_err(ProvisioningError::InvalidPni)?;
+
+        let aci_key_pair = provisioned_key_pair(
+            message.aci_identity_key_public,
+            message.aci_identity_key_private,
+        )?;
+
+        // Empty means absent, as Signal-Desktop reads it. The server's salt is
+        // always 16 bytes (`AccountsManager.AUTH_CREDENTIAL_SALT_SIZE`).
+        let auth_credential_salt: Option<[u8; 16]> = message
+            .auth_credential_salt
+            .filter(|salt| !salt.is_empty())
+            .map(|salt| {
+                salt.try_into().map_err(|salt: Vec<u8>| {
+                    ProvisioningError::InvalidAuthCredentialSalt(salt.len())
+                })
+            })
+            .transpose()?;
+
+        let phone_number_identity = if let Some(pni) = pni {
+            let key_pair = provisioned_key_pair(
+                message.pni_identity_key_public,
+                message.pni_identity_key_private,
+            )?;
+            let phone_number = message
+                .number
+                .ok_or(ProvisioningError::MissingPhoneNumber)?
+                .parse()
+                .map_err(ProvisioningError::InvalidPhoneNumber)?;
+            Some(PhoneNumberIdentity {
+                pni,
+                phone_number,
+                key_pair,
+            })
+        } else if message
+            .pni_identity_key_private
+            .is_some_and(|key| !key.is_empty())
+        {
+            // The private key alone decides, as in Signal-Desktop.
+            return Err(ProvisioningError::PniKeyWithoutPni);
+        } else if auth_credential_salt.is_none() {
+            return Err(ProvisioningError::MissingAuthCredentialSalt);
+        } else {
+            None
+        };
+
+        let profile_key = ProfileKey::create(
+            message
+                .profile_key
+                .ok_or(ProvisioningError::MissingProfileKey)?
+                .as_slice()
+                .try_into()
+                .map_err(ProvisioningError::InvalidProfileKey)?,
+        );
 
         // Optional in the proto (field 13 deprecated, field 15 modern).
-        // Moved out — partial move, the remaining field accesses below are
-        // independent. presage prefers AEP if both are present.
+        // presage prefers AEP if both are present.
         let account_entropy_pool = message
             .account_entropy_pool
             .map(|s| s.parse())
@@ -337,131 +625,55 @@ async fn link_steps<
             })
             .transpose()?;
 
-        let phone_number = message
-            .number
-            .ok_or(ProvisioningError::MissingPhoneNumber)?;
-
-        let phone_number = phone_number
-            .parse::<E164>()
-            .map_err(ProvisioningError::InvalidPhoneNumber)?;
-
         let provisioning_code = message
             .provisioning_code
             .ok_or(ProvisioningError::MissingProvisioningCode)?;
 
-        let aci_key_pair =
-            IdentityKeyPair::new(aci_public_key, aci_private_key);
-        let pni_key_pair =
-            IdentityKeyPair::new(pni_public_key, pni_private_key);
-
-        let (
-            _aci_pre_keys,
-            aci_signed_pre_key,
-            _aci_pq_pre_keys,
-            aci_pq_last_resort_pre_key,
-        ) = crate::pre_keys::replenish_pre_keys(
-            aci_store,
-            csprng,
-            clock,
-            &aci_key_pair,
-            true,
-            0,
-            0,
-        )
-        .await?;
-
-        let aci_pq_last_resort_pre_key =
-            aci_pq_last_resort_pre_key.expect("requested last resort key");
-        assert!(_aci_pre_keys.is_empty());
-        assert!(_aci_pq_pre_keys.is_empty());
-
-        let (
-            _pni_pre_keys,
-            pni_signed_pre_key,
-            _pni_pq_pre_keys,
-            pni_pq_last_resort_pre_key,
-        ) = crate::pre_keys::replenish_pre_keys(
-            pni_store,
-            csprng,
-            clock,
-            &pni_key_pair,
-            true,
-            0,
-            0,
-        )
-        .await?;
-
-        let pni_pq_last_resort_pre_key =
-            pni_pq_last_resort_pre_key.expect("requested last resort key");
-        assert!(_pni_pre_keys.is_empty());
-        assert!(_pni_pq_pre_keys.is_empty());
-
-        let encrypted_device_name = BASE64_RELAXED.encode(
-            encrypt_device_name(csprng, device_name, &aci_public_key)?
-                .encode_to_vec(),
-        );
-
-        let profile_key = ProfileKey::create(
-            profile_key
-                .as_slice()
-                .try_into()
-                .map_err(ProvisioningError::InvalidProfileKey)?,
-        );
-
-        let request = LinkRequest {
-            verification_code: provisioning_code,
-            account_attributes: LinkAccountAttributes {
-                registration_id,
-                pni_registration_id,
-                fetches_messages: true,
-                capabilities: LinkCapabilities::default(),
-                name: encrypted_device_name,
-            },
-            device_activation_request: DeviceActivationRequest {
-                aci_signed_pre_key: aci_signed_pre_key.try_into()?,
-                pni_signed_pre_key: pni_signed_pre_key.try_into()?,
-                aci_pq_last_resort_pre_key: aci_pq_last_resort_pre_key
-                    .try_into()?,
-                pni_pq_last_resort_pre_key: pni_pq_last_resort_pre_key
-                    .try_into()?,
-            },
-        };
-
-        let LinkResponse {
+        Ok(Self {
             aci,
-            pni,
-            device_id,
-        } = push_service
-            .link_device(
-                &request,
-                HttpAuth {
-                    username: phone_number.to_string(),
-                    password: password.to_owned(),
-                },
-            )
-            .await?;
-
-        tx.send(SecondaryDeviceProvisioning::NewDeviceRegistration(
-            NewDeviceRegistration {
-                phone_number,
-                service_ids: ServiceIds { aci, pni },
-                device_id,
-                registration_id,
-                pni_registration_id,
-                aci_private_key,
-                aci_public_key,
-                pni_private_key,
-                pni_public_key,
-                profile_key,
-                account_entropy_pool,
-                ephemeral_backup_key,
-            },
-        ))
-        .await
-        .expect("failed to send provisioning message in rx channel");
-    } else {
-        return Err(ProvisioningError::InvalidStep);
+            aci_key_pair,
+            phone_number_identity,
+            auth_credential_salt,
+            profile_key,
+            account_entropy_pool,
+            ephemeral_backup_key,
+            provisioning_code,
+        })
     }
+}
 
-    Ok(())
+/// An id in a provisioning message: its binary form if set, else its string,
+/// as Signal-Desktop reads them (`ProvisioningCipher.node.ts`). Empty means
+/// absent.
+fn provisioned_id(
+    binary: &Option<Vec<u8>>,
+    string: &Option<String>,
+) -> Result<Option<Uuid>, uuid::Error> {
+    match (binary, string) {
+        (Some(binary), _) if !binary.is_empty() => {
+            Uuid::from_slice(binary).map(Some)
+        },
+        (_, Some(string)) if !string.is_empty() => {
+            Uuid::parse_str(string).map(Some)
+        },
+        _ => Ok(None),
+    }
+}
+
+fn provisioned_key_pair(
+    public_key: Option<Vec<u8>>,
+    private_key: Option<Vec<u8>>,
+) -> Result<IdentityKeyPair, ProvisioningError> {
+    let public_key = PublicKey::deserialize(
+        &public_key.ok_or(ProvisioningError::MissingPublicKey)?,
+    )
+    .map_err(ProvisioningError::invalid_public_key)?;
+    let private_key = PrivateKey::deserialize(
+        &private_key.ok_or(ProvisioningError::MissingPrivateKey)?,
+    )
+    .map_err(ProvisioningError::invalid_private_key)?;
+    Ok(IdentityKeyPair::new(
+        IdentityKey::new(public_key),
+        private_key,
+    ))
 }

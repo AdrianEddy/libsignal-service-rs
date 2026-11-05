@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use http::Method;
 use serde::{Deserialize, Serialize};
@@ -8,8 +10,9 @@ use crate::{
     proto::DeviceName,
     push_service::response::SignalServiceResponse,
     utils::{
-        serde_device_id, serde_e164, serde_optional_base64,
-        serde_optional_base64_url_safe_no_pad, serde_optional_prost_base64,
+        serde_device_id, serde_optional_base64,
+        serde_optional_base64_url_safe_no_pad, serde_optional_e164,
+        serde_optional_prost_base64,
     },
     websocket,
 };
@@ -62,11 +65,20 @@ pub struct AccountAttributes {
     pub unidentified_access_key: Option<Vec<u8>>,
     pub unrestricted_unidentified_access: bool,
     pub discoverable_by_phone_number: bool,
+    /// The device's capabilities by name, the caller's record, as in
+    /// [`LinkAccountAttributes::capabilities`]. Signal-Server replaces the
+    /// device's set with it, so an account without a phone number says
+    /// `optionalPhoneNumber` here too.
+    ///
+    /// [`LinkAccountAttributes::capabilities`]: crate::push_service::linking::LinkAccountAttributes::capabilities
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<DeviceCapabilities>,
+    pub capabilities: Option<BTreeMap<String, bool>>,
     #[serde(default, with = "serde_optional_prost_base64")]
     pub name: Option<DeviceName>,
-    pub pni_registration_id: u32,
+    /// `None` for an account without a phone number, which Signal-Desktop
+    /// sends as `null` (`assembleAccountAttributes.preload.ts`).
+    #[serde(default)]
+    pub pni_registration_id: Option<u32>,
     #[serde(
         default,
         with = "serde_optional_base64",
@@ -75,60 +87,17 @@ pub struct AccountAttributes {
     pub recovery_password: Option<Vec<u8>>,
 }
 
-// Keep in sync with https://github.com/signalapp/Signal-Server/blob/main/service/src/main/java/org/whispersystems/textsecuregcm/storage/DeviceCapability.java.
-// When updating this, also consider updating LinkCapabilities.
-#[derive(Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceCapabilities {
-    #[serde(default)]
-    pub storage: bool,
-    #[serde(default)]
-    pub transfer: bool,
-    #[serde(default)]
-    pub attachment_backfill: bool,
-    #[serde(default)]
-    pub spqr: bool,
-    // For some reason, this uses snake case while everything else uses camel case.
-    #[serde(default, rename = "profiles_v2")]
-    pub profiles_v2: bool,
-    #[serde(default)]
-    pub username_change_sync_message: bool,
-}
-
-impl Default for DeviceCapabilities {
-    fn default() -> Self {
-        DeviceCapabilities {
-            storage: false,
-            transfer: false,
-            attachment_backfill: false,
-            spqr: true,
-            profiles_v2: false,
-            username_change_sync_message: false,
-        }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    #[test]
-    fn device_capabilities_serialization_weird_casing() {
-        let capabilities = super::DeviceCapabilities::default();
-        let json = serde_json::to_string(&capabilities)
-            .expect("Serialize capabilities");
-        assert!(json.contains("usernameChangeSyncMessage"));
-        assert!(json.contains("profiles_v2"));
-    }
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(derive_more::Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WhoAmIResponse {
     #[serde(rename = "uuid")]
     pub aci: Uuid,
-    #[serde(default)] // nil when not present (yet)
-    pub pni: Uuid,
-    #[serde(with = "serde_e164")]
-    pub number: libsignal_core::E164,
+    /// `None` for an account without a phone number.
+    #[serde(default)]
+    pub pni: Option<Uuid>,
+    /// `None` for an account without a phone number.
+    #[serde(default, with = "serde_optional_e164")]
+    pub number: Option<libsignal_core::E164>,
     /// Hash of the account's username, if one is set.
     #[serde(default, with = "serde_optional_base64_url_safe_no_pad")]
     pub username_hash: Option<Vec<u8>>,
@@ -138,6 +107,10 @@ pub struct WhoAmIResponse {
     /// server never sees; only the full `signal.me` link carries it.
     #[serde(default)]
     pub username_link_handle: Option<Uuid>,
+    /// The salt group credentials need on an account without a phone number.
+    #[debug(ignore)]
+    #[serde(default, with = "serde_optional_base64")]
+    pub auth_credential_salt: Option<Vec<u8>>,
 }
 
 impl SignalWebSocket<websocket::Identified> {

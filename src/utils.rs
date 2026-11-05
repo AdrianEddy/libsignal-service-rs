@@ -453,30 +453,6 @@ pub mod serde_optional_e164 {
     }
 }
 
-pub mod serde_e164 {
-    use libsignal_core::E164;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(
-        phone_number: &E164,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&phone_number.to_string())
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<E164, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        <&str>::deserialize(deserializer)?
-            .parse()
-            .map_err(serde::de::Error::custom)
-    }
-}
-
 #[cfg(feature = "phonenumber")]
 pub mod serde_phone_number {
     use phonenumber::PhoneNumber;

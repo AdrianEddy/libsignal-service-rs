@@ -23,27 +23,45 @@ use crate::{
 
 use super::cipher::ProvisioningCipher;
 
+/// A new device's end of the provisioning socket: it turns the server's
+/// requests into the link to show and the primary device's provisioning
+/// message.
 pub struct ProvisioningPipe {
     ws: SignalWebSocket<websocket::Unidentified>,
     provisioning_cipher: ProvisioningCipher,
+    /// The link's `capabilities` value, comma-separated; empty for none.
+    capabilities: String,
 }
 
 #[expect(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ProvisioningStep {
     Url(Url),
+    /// The primary device's message, raw:
+    /// [`ProvisionedAccount`](super::ProvisionedAccount) reads and checks it.
     Message(ProvisionMessage),
 }
 
 impl ProvisioningPipe {
+    /// A pipe over a provisioning socket, with a new provisioning key pair.
+    ///
+    /// The link carries `capabilities`, which tell the primary device what
+    /// this device can do: Signal-Desktop sends `nopni` and `nopni2` (it can
+    /// link an account without a phone number) and `backup5` (it can import
+    /// a transfer archive). Signal-Android won't link a device that doesn't
+    /// say `nopni2` to an account without a phone number, and links one that
+    /// doesn't say `backup5` without history. No capabilities, no
+    /// `capabilities` parameter.
     pub fn from_socket<R: Rng + CryptoRng>(
         ws: SignalWebSocket<websocket::Unidentified>,
         csprng: &mut R,
+        capabilities: &[&str],
     ) -> Self {
         let key_pair = KeyPair::generate(csprng);
         ProvisioningPipe {
             ws,
             provisioning_cipher: ProvisioningCipher::from_key_pair(key_pair),
+            capabilities: capabilities.join(","),
         }
     }
 
@@ -110,6 +128,13 @@ impl ProvisioningPipe {
                             self.provisioning_cipher.public_key().serialize(),
                         ),
                     );
+                // Form-encoded as Signal-Desktop's `URLSearchParams` does
+                // (`signalRoutes.std.ts`): the commas become `%2C`.
+                if !self.capabilities.is_empty() {
+                    provisioning_url
+                        .query_pairs_mut()
+                        .append_pair("capabilities", &self.capabilities);
+                }
 
                 // acknowledge
                 responder

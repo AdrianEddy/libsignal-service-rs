@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use http::Method;
 use libsignal_core::DeviceId;
 use serde::{Deserialize, Serialize};
@@ -19,32 +21,16 @@ pub struct LinkAccountAttributes {
     pub fetches_messages: bool,
     pub name: String,
     pub registration_id: u32,
-    pub pni_registration_id: u32,
-    pub capabilities: LinkCapabilities,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-// Keep in sync with https://github.com/signalapp/Signal-Desktop/blob/main/ts/types/Capabilities.d.ts.
-pub struct LinkCapabilities {
-    pub attachment_backfill: bool,
-    /// Sparse Post-Quantum Ratchet (`SPARSE_POST_QUANTUM_RATCHET` on Signal Server).
-    ///
-    /// Required for all devices; the server returns 409 if a linking device omits this capability
-    /// while the account already has it on any existing device.
-    pub spqr: bool,
-    pub username_change_sync_message: bool,
-}
-
-// https://github.com/signalapp/Signal-Desktop/blob/1e57db6aa4786dcddc944349e4894333ac2ffc9e/ts/textsecure/WebAPI.ts#L1287
-impl Default for LinkCapabilities {
-    fn default() -> Self {
-        Self {
-            attachment_backfill: false,
-            spqr: true,
-            username_change_sync_message: true,
-        }
-    }
+    /// Only for an account with a phone number (Signal-Desktop
+    /// `WebAPI.preload.ts` `linkDevice`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pni_registration_id: Option<u32>,
+    /// The device's capabilities by name, the caller's record: Signal-Server
+    /// reads a `Map<String, Boolean>` (`DeviceCapabilityAdapter`). It refuses
+    /// a link without `spqr` or, on an account without a phone number,
+    /// without `optionalPhoneNumber` (409), and one that drops a capability
+    /// the account can't lose (409, `DeviceCapability`).
+    pub capabilities: BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -52,7 +38,9 @@ impl Default for LinkCapabilities {
 pub struct LinkResponse {
     #[serde(rename = "uuid")]
     pub aci: Uuid,
-    pub pni: Uuid,
+    /// `None` for an account without a phone number.
+    #[serde(default)]
+    pub pni: Option<Uuid>,
     #[serde(with = "serde_device_id")]
     pub device_id: DeviceId,
 }
@@ -66,16 +54,33 @@ pub struct LinkRequest {
     pub device_activation_request: DeviceActivationRequest,
 }
 
+// 422: the request failed the server's validation. The body carries bean
+// validation's errors, if that is what failed; the controller's own 422s
+// have an empty body.
+async fn invalid_link_request<R>(response: R) -> ServiceError
+where
+    R: SignalServiceResponse,
+{
+    ServiceError::InvalidLinkRequest {
+        body: response.error_body().await,
+    }
+}
+
 // Signal-Server: controllers/DeviceController.java:231
 // (PUT /v1/devices/link)
 error_mapper! {
     link_device_errors:
         // 403: invalid device verification code, DeviceController.java:238
         FORBIDDEN => InvalidDeviceVerificationCode,
-        // 409: device capability downgrade, DeviceController.java:267
+        // 409: a capability missing (`optionalPhoneNumber` on an account
+        // without a phone number) or downgraded, DeviceController.java:248, 279
         CONFLICT => DeviceCapabilityDowngrade,
         // 411: device limit reached, DeviceController.java:260
         LENGTH_REQUIRED => fn device_limit_reached,
+        // 422: bad prekey signatures, PNI keys on an account without a PNI
+        // or missing on one with it, no capabilities, or a body that fails
+        // validation, DeviceController.java:271, 277
+        UNPROCESSABLE_ENTITY => fn invalid_link_request,
 }
 
 impl PushService {

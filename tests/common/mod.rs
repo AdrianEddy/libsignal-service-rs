@@ -268,7 +268,7 @@ pub fn credentials() -> ServiceCredentials {
     ServiceCredentials {
         aci: Some(ACI),
         pni: None,
-        phonenumber: "+15550100".parse().unwrap(),
+        phonenumber: Some("+15550100".parse().unwrap()),
         password: Some("hunter2".into()),
         device_id: Some(DeviceId::new(2).unwrap()),
     }
@@ -277,7 +277,8 @@ pub fn credentials() -> ServiceCredentials {
 pub fn push_service() -> (PushService, Rc<MemoryTransport>) {
     let transport = Rc::new(MemoryTransport::default());
     let service =
-        PushService::new(environment(), Some(credentials()), transport.clone());
+        PushService::new(environment(), Some(credentials()), transport.clone())
+            .unwrap();
     (service, transport)
 }
 

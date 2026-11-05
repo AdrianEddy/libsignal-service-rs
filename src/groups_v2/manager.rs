@@ -216,12 +216,19 @@ impl<C: CredentialsCache> GroupsManager<C> {
         today: u64,
     ) -> Result<HttpAuth, ServiceError> {
         let redemption_time = zkgroup::Timestamp::from_epoch_seconds(today);
+        // An account without a phone number receives its credential with
+        // the auth credential salt instead (`receive_without_pni`), which
+        // this manager doesn't take.
+        let pni = self
+            .service_ids
+            .pni()
+            .ok_or(ServiceError::GroupCredentialsWithoutPni)?;
 
         let auth_credential_bytes =
             zkgroup::serialize(&credential_response.receive(
                 &self.server_public_params,
                 self.service_ids.aci(),
-                self.service_ids.pni(),
+                pni,
                 redemption_time,
             )?);
 

@@ -13,7 +13,7 @@ use futures::{
 };
 use http::{header, Method, StatusCode};
 use libsignal_service::{
-    configuration::Endpoint,
+    configuration::{Endpoint, ServiceCredentials},
     master_key::StorageServiceKey,
     messagepipe::Incoming,
     prelude::{AttachmentIdentifier, AttachmentPointer, ProtobufMessage},
@@ -23,18 +23,16 @@ use libsignal_service::{
     protocol::DeviceId,
     provisioning::ProvisioningError,
     push_service::{
-        linking::{
-            LinkAccountAttributes, LinkCapabilities, LinkRequest, LinkResponse,
-        },
-        AttachmentV2UploadAttributes, HttpAuth, HttpAuthOverride, ServiceError,
-        ERROR_BODY_LIMIT,
+        linking::{LinkAccountAttributes, LinkRequest, LinkResponse},
+        AttachmentV2UploadAttributes, HttpAuth, HttpAuthOverride, PushService,
+        ServiceError, ERROR_BODY_LIMIT,
     },
     receiver::MessageReceiver,
     sender::{AttachmentUploadError, MessageSenderError},
     transport::{EndpointKind, TransportError, TransportErrorKind, WsEvent},
     websocket::{
-        registration::DeviceActivationRequest, Identified, SocketEnd,
-        Unidentified,
+        registration::{DeviceActivationRequest, PniPreKeys},
+        Identified, SocketEnd, Unidentified,
     },
     ProfileManagerError, StorageService, StorageServiceError,
 };
@@ -60,14 +58,16 @@ fn link_request() -> LinkRequest {
             fetches_messages: true,
             name: "name".into(),
             registration_id: 11,
-            pni_registration_id: 12,
-            capabilities: LinkCapabilities::default(),
+            pni_registration_id: Some(12),
+            capabilities: [("spqr".to_owned(), true)].into(),
         },
         device_activation_request: DeviceActivationRequest {
             aci_signed_pre_key: signed(1),
-            pni_signed_pre_key: signed(2),
             aci_pq_last_resort_pre_key: kyber(3),
-            pni_pq_last_resort_pre_key: kyber(4),
+            pni: Some(PniPreKeys {
+                pni_signed_pre_key: signed(2),
+                pni_pq_last_resort_pre_key: kyber(4),
+            }),
         },
     }
 }
@@ -103,7 +103,7 @@ async fn push_service_builds_requests_without_reqwest() {
         .unwrap();
     assert_eq!(
         (aci, pni, device_id),
-        (ACI, Uuid::from_u128(9), DeviceId::new(3).unwrap())
+        (ACI, Some(Uuid::from_u128(9)), DeviceId::new(3).unwrap())
     );
     let link = transport.take_one();
     assert_eq!(link.method, Method::PUT);
@@ -119,6 +119,10 @@ async fn push_service_builds_requests_without_reqwest() {
     let body: serde_json::Value = serde_json::from_slice(&link.body).unwrap();
     assert_eq!(body["verificationCode"], "code");
     assert_eq!(body["accountAttributes"]["registrationId"], 11);
+    assert_eq!(
+        body["accountAttributes"]["capabilities"],
+        serde_json::json!({ "spqr": true })
+    );
     assert_eq!(body["aciSignedPreKey"]["keyId"], 1);
     assert_eq!(body["pniPqLastResortPreKey"]["keyId"], 4);
 
@@ -571,6 +575,79 @@ async fn invalid_header_fails_without_a_request() {
         .err()
         .expect("an invalid header");
     assert!(matches!(error, ServiceError::InvalidHeader(_)), "{error:?}");
+    assert_eq!(transport.handshakes(), 0);
+}
+
+/// An account without a phone number logs in as its ACI; credentials that
+/// can't log in make no service, instead of one that sends no credentials,
+/// and open no identified socket, instead of one with an empty password.
+#[tokio::test]
+async fn credentials_without_a_phone_number_log_in_as_the_aci() {
+    let numberless = ServiceCredentials {
+        phonenumber: None,
+        ..credentials()
+    };
+    assert_eq!(numberless.e164(), None);
+    assert_eq!(numberless.login(), Some(format!("{ACI}.2")));
+    let transport = Rc::new(MemoryTransport::default());
+    let service =
+        PushService::new(environment(), Some(numberless), transport.clone())
+            .unwrap();
+    transport.answer(Answer::status(204));
+    service
+        .request(
+            Method::GET,
+            Endpoint::service("/v1/anything"),
+            HttpAuthOverride::NoOverride,
+        )
+        .unwrap()
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        transport.take_one().header(header::AUTHORIZATION),
+        Some(&*basic(&format!("{ACI}.2:hunter2")))
+    );
+
+    for cannot_log_in in [
+        ServiceCredentials {
+            aci: None,
+            phonenumber: None,
+            ..credentials()
+        },
+        ServiceCredentials {
+            password: None,
+            ..credentials()
+        },
+    ] {
+        assert!(cannot_log_in.authorization().is_none());
+        let error = PushService::new(
+            environment(),
+            Some(cannot_log_in.clone()),
+            transport.clone(),
+        )
+        .err()
+        .expect("no login");
+        assert!(
+            matches!(error, ServiceError::MissingCredentials),
+            "{error:?}"
+        );
+        let error = service
+            .ws::<Identified>(
+                "/v1/websocket/",
+                "/v1/keepalive",
+                &[],
+                Some(cannot_log_in),
+                Rc::new(ManualClock::default()),
+            )
+            .await
+            .err()
+            .expect("no login");
+        assert!(
+            matches!(error, ServiceError::MissingCredentials),
+            "{error:?}"
+        );
+    }
     assert_eq!(transport.handshakes(), 0);
 }
 

@@ -38,6 +38,8 @@ fn main() {
             ".signalservice.Envelope.content",
             ".signalservice.WebSocketRequestMessage.body",
         ])
+        // Hand-written in `proto.rs`: it holds the account's private keys.
+        .skip_debug([".signalservice.ProvisionMessage"])
         .compile_protos(&input, &[protobuf])
         .unwrap();
 }

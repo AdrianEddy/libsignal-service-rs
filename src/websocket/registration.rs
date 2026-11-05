@@ -88,13 +88,26 @@ pub struct RegistrationKeyPackage {
     pub pni_pq_last_resort_pre_key: KyberPreKeyEntity,
 }
 
+/// The prekeys of an account's PNI, for an account with a phone number. The
+/// fields keep their prefix because [`DeviceActivationRequest`] flattens them:
+/// these names are the wire's.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PniPreKeys {
+    pub pni_signed_pre_key: SignedPreKeyEntity,
+    pub pni_pq_last_resort_pre_key: KyberPreKeyEntity,
+}
+
+/// A new device's prekeys. The PNI's are present exactly when the account
+/// has a phone number: Signal-Server refuses PNI keys on an account without a
+/// PNI and their absence on one with it (422, `DeviceController.java`).
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceActivationRequest {
     pub aci_signed_pre_key: SignedPreKeyEntity,
-    pub pni_signed_pre_key: SignedPreKeyEntity,
     pub aci_pq_last_resort_pre_key: KyberPreKeyEntity,
-    pub pni_pq_last_resort_pre_key: KyberPreKeyEntity,
+    #[serde(flatten)]
+    pub pni: Option<PniPreKeys>,
 }
 
 #[derive(Debug, Serialize)]

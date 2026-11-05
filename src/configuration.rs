@@ -58,37 +58,40 @@ impl ServiceConfiguration {
 pub struct ServiceCredentials {
     pub aci: Option<uuid::Uuid>,
     pub pni: Option<uuid::Uuid>,
-    pub phonenumber: E164,
+    /// `None` for an account without a phone number.
+    pub phonenumber: Option<E164>,
     pub password: Option<String>,
     pub device_id: Option<DeviceId>,
 }
 
 impl ServiceCredentials {
+    /// Basic authentication as [`login`](Self::login) with the password;
+    /// `None` without either.
     pub fn authorization(&self) -> Option<HttpAuth> {
-        self.password.as_ref().map(|password| HttpAuth {
-            username: self.login(),
-            password: password.clone(),
+        Some(HttpAuth {
+            username: self.login()?,
+            password: self.password.clone()?,
         })
     }
 
-    pub fn e164(&self) -> String {
-        self.phonenumber.to_string()
+    pub fn e164(&self) -> Option<String> {
+        self.phonenumber.as_ref().map(E164::to_string)
     }
 
-    pub fn login(&self) -> String {
-        let identifier = {
-            if let Some(uuid) = self.aci.as_ref() {
-                uuid.to_string()
-            } else {
-                self.e164()
-            }
+    /// The basic-authentication user name: the ACI, or else the phone
+    /// number, with `.<device id>` for a linked device; `None` without
+    /// either.
+    pub fn login(&self) -> Option<String> {
+        let identifier = match self.aci {
+            Some(aci) => aci.to_string(),
+            None => self.e164()?,
         };
 
-        match self.device_id {
+        Some(match self.device_id {
             None => identifier,
             Some(device_id) if device_id == *DEFAULT_DEVICE_ID => identifier,
             Some(id) => format!("{}.{}", identifier, id),
-        }
+        })
     }
 }
 

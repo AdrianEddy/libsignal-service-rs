@@ -108,18 +108,22 @@ pub struct PushService {
 }
 
 impl PushService {
+    /// Credentials that can't log in are
+    /// [`ServiceError::MissingCredentials`], as in [`ws`](Self::ws).
     pub fn new(
         cfg: ServiceConfiguration,
         credentials: Option<ServiceCredentials>,
         transport: Rc<dyn Transport>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ServiceError> {
+        let authorization = credentials
+            .map(|c| c.authorization().ok_or(ServiceError::MissingCredentials))
+            .transpose()?
+            .map(|auth| auth.header_value());
+        Ok(Self {
             cfg: Rc::new(cfg),
-            authorization: credentials
-                .and_then(|c| c.authorization())
-                .map(|auth| auth.header_value()),
+            authorization,
             transport,
-        }
+        })
     }
 
     #[tracing::instrument(skip(self), fields(endpoint = %endpoint))]
@@ -156,7 +160,9 @@ impl PushService {
     }
 
     /// Opens a WebSocket to the chat service at `path` through the
-    /// transport, with basic authentication when `credentials` are given.
+    /// transport, with basic authentication when `credentials` are given;
+    /// credentials without a password, or without an ACI or a phone number,
+    /// are [`ServiceError::MissingCredentials`].
     ///
     /// Returns the socket's handle and its task, which the caller runs and
     /// `clock` times (see [`SignalWebSocket::new`]).
@@ -189,10 +195,10 @@ impl PushService {
             );
         }
         if let Some(credentials) = credentials {
-            let auth = HttpAuth {
-                username: credentials.login(),
-                password: credentials.password.unwrap_or_default(),
-            };
+            // An identified socket never opens without its credentials.
+            let auth = credentials
+                .authorization()
+                .ok_or(ServiceError::MissingCredentials)?;
             headers.insert(AUTHORIZATION, auth.header_value());
         }
 

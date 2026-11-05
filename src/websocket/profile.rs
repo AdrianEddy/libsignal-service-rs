@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use http::Method;
 use libsignal_protocol::Aci;
 use serde::{Deserialize, Serialize};
@@ -8,7 +10,7 @@ use crate::{
     push_service::response::SignalServiceResponse,
     push_service::AvatarWrite,
     utils::{serde_base64, serde_optional_base64},
-    websocket::{self, account::DeviceCapabilities, SignalWebSocket},
+    websocket::{self, SignalWebSocket},
 };
 
 /// A donation badge returned by the server on profile fetch.
@@ -65,7 +67,9 @@ pub struct SignalServiceProfile {
     #[serde(default)]
     pub unrestricted_unidentified_access: bool,
 
-    pub capabilities: DeviceCapabilities,
+    /// The account's public capabilities by name (Signal-Server
+    /// `BaseProfileResponse`).
+    pub capabilities: BTreeMap<String, bool>,
 
     /// Donation badges the server reports for this profile.
     #[serde(default)]

@@ -26,6 +26,13 @@ impl WebSocketResponseMessage {
     }
 }
 
+/// Prints no field: the message holds the account's private keys.
+impl std::fmt::Debug for ProvisionMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvisionMessage").finish_non_exhaustive()
+    }
+}
+
 impl SyncMessage {
     pub fn with_padding<R: Rng + CryptoRng>(csprng: &mut R) -> Self {
         let random_size = csprng.random_range(1..=512);

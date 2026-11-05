@@ -124,7 +124,7 @@ fn service(answers: Vec<Answer>) -> (PushService, Rc<Script>) {
     let script = Rc::new(Script::default());
     script.answers.borrow_mut().extend(answers);
     let cfg = ServiceConfiguration::from(SignalServers::Staging);
-    (PushService::new(cfg, None, script.clone()), script)
+    (PushService::new(cfg, None, script.clone()).unwrap(), script)
 }
 
 fn header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {

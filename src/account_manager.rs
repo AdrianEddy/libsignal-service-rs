@@ -388,6 +388,7 @@ impl AccountManager {
             ephemeral_backup_key,
             account_entropy_pool,
             media_root_backup_key,
+            auth_credential_salt,
         } = secrets;
 
         let query: HashMap<_, _> = url.query_pairs().collect();
@@ -405,14 +406,17 @@ impl AccountManager {
 
         let aci_identity_key_pair =
             aci_identity_store.get_identity_key_pair().await?;
-        let pni_identity_key_pair =
-            pni_identity_store.get_identity_key_pair().await?;
+        // An account without a phone number has no PNI identity; the new
+        // device gets the salt for its group credentials instead
+        // (Signal-Desktop `ProvisioningCipher.node.ts`, which refuses a PNI
+        // key pair without a PNI).
+        let pni_identity_key_pair = match credentials.pni {
+            Some(_) => Some(pni_identity_store.get_identity_key_pair().await?),
+            None => None,
+        };
 
         if credentials.aci.is_none() {
             tracing::warn!("No local ACI set");
-        }
-        if credentials.pni.is_none() {
-            tracing::warn!("No local PNI set");
         }
 
         let provisioning_code = self.new_device_provisioning_code().await?;
@@ -425,15 +429,15 @@ impl AccountManager {
             aci_identity_key_private: Some(
                 aci_identity_key_pair.private_key().serialize(),
             ),
-            pni_identity_key_public: Some(
-                pni_identity_key_pair.public_key().serialize().into_vec(),
-            ),
-            pni_identity_key_private: Some(
-                pni_identity_key_pair.private_key().serialize(),
-            ),
+            pni_identity_key_public: pni_identity_key_pair
+                .as_ref()
+                .map(|pair| pair.public_key().serialize().into_vec()),
+            pni_identity_key_private: pni_identity_key_pair
+                .as_ref()
+                .map(|pair| pair.private_key().serialize()),
             aci: credentials.aci.as_ref().map(|u| u.to_string()),
             pni: credentials.pni.as_ref().map(uuid::Uuid::to_string),
-            number: Some(credentials.e164()),
+            number: credentials.e164(),
             provisioning_code: Some(provisioning_code),
             user_agent: None,
             profile_key: self.profile_key.as_ref().map(|x| x.bytes.to_vec()),
@@ -447,6 +451,7 @@ impl AccountManager {
             media_root_backup_key: media_root_backup_key.map(|k| k.to_vec()), // 32-bytes
             aci_binary: credentials.aci.map(|u| u.into_bytes().into()),
             pni_binary: credentials.pni.map(|u| u.into_bytes().into()),
+            auth_credential_salt: auth_credential_salt.map(|k| k.to_vec()), // 16-bytes
         };
 
         let cipher = ProvisioningCipher::from_public(pub_key);

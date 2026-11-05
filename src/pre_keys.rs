@@ -205,8 +205,9 @@ pub(crate) fn generate_kyber_pre_key<R: Rng + CryptoRng>(
 }
 
 /// Generates and stores a batch of prekeys. Every signed and Kyber prekey of
-/// the batch carries the same creation time, read once from `clock`.
-pub(crate) async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
+/// the batch carries the same creation time, read once from `clock`. Nothing
+/// is sent: the caller uploads what it returns once the store has it.
+pub async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
     protocol_store: &mut P,
     csprng: &mut R,
     clock: &dyn Clock,
