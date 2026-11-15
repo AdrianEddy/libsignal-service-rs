@@ -15,7 +15,11 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{future::LocalBoxFuture, stream::LocalBoxStream, Stream};
+use futures::{
+    future::LocalBoxFuture,
+    stream::{BoxStream, LocalBoxStream},
+    Stream,
+};
 use http::{HeaderMap, Method, StatusCode};
 use url::{Position, Url};
 
@@ -91,13 +95,20 @@ pub enum EndpointKind {
     Cdn(u32),
 }
 
+/// A request body.
+///
+/// A stream is `Send`, unlike lss's other network types: the transport hands
+/// the body on to whatever writes the connection, which may run on another
+/// thread than the caller (an HTTP client's connection task), while the
+/// response comes back to the caller's own task. Every body lss builds is
+/// made of buffers it already holds.
 pub enum HttpBody {
     Empty,
     Bytes(Bytes),
     /// Exactly `len` bytes.
     Stream {
         len: u64,
-        stream: LocalBoxStream<'static, io::Result<Bytes>>,
+        stream: BoxStream<'static, io::Result<Bytes>>,
     },
 }
 

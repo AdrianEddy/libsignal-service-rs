@@ -73,8 +73,7 @@ impl Form {
         ))
         .expect("the boundary is a valid header value");
         let stream =
-            stream::iter([head, content, tail].map(Ok::<_, io::Error>))
-                .boxed_local();
+            stream::iter([head, content, tail].map(Ok::<_, io::Error>)).boxed();
         (content_type, HttpBody::Stream { len, stream })
     }
 

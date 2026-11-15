@@ -29,7 +29,10 @@ use libsignal_service::{
     },
     receiver::MessageReceiver,
     sender::{AttachmentUploadError, MessageSenderError},
-    transport::{EndpointKind, TransportError, TransportErrorKind, WsEvent},
+    transport::{
+        EndpointKind, HttpBody, HttpRequest, TransportError,
+        TransportErrorKind, WsEvent,
+    },
     websocket::{
         registration::{DeviceActivationRequest, PniPreKeys},
         Identified, SocketEnd, Unidentified,
@@ -337,6 +340,16 @@ async fn cdn_multipart_matches_reqwest_form_bytes() {
 }
 
 fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+
+fn assert_send_static<T: Send + 'static>() {}
+
+#[test]
+fn request_bodies_are_send() {
+    // A transport hands the request on to whatever writes the connection,
+    // which may run on another thread than lss.
+    assert_send_static::<HttpBody>();
+    assert_send_static::<HttpRequest>();
+}
 
 #[tokio::test]
 async fn errors_carry_no_reqwest_type() {
