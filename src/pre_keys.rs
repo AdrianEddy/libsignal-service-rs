@@ -1,4 +1,4 @@
-use std::convert::TryFrom;
+use std::{convert::TryFrom, time::SystemTime};
 
 use crate::{
     timestamp::epoch_millis,
@@ -40,13 +40,13 @@ pub trait KyberPreKeyStoreExt: KyberPreKeyStore {
     /// Analogous to markAllOneTimeKyberPreKeysStaleIfNecessary
     async fn mark_all_one_time_kyber_pre_keys_stale_if_necessary(
         &mut self,
-        stale_time: chrono::DateTime<chrono::Utc>,
+        stale_time: SystemTime,
     ) -> Result<(), SignalProtocolError>;
 
     /// Analogue of deleteAllStaleOneTimeKyberPreKeys
     async fn delete_all_stale_one_time_kyber_pre_keys(
         &mut self,
-        threshold: chrono::DateTime<chrono::Utc>,
+        threshold: SystemTime,
         min_count: usize,
     ) -> Result<(), SignalProtocolError>;
 }

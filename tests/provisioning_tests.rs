@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::{collections::BTreeMap, rc::Rc};
+use std::{collections::BTreeMap, rc::Rc, time::SystemTime};
 
 use async_trait::async_trait;
 use futures::{
@@ -1115,14 +1115,14 @@ impl KyberPreKeyStoreExt for LocalStore {
 
     async fn mark_all_one_time_kyber_pre_keys_stale_if_necessary(
         &mut self,
-        _: chrono::DateTime<chrono::Utc>,
+        _: SystemTime,
     ) -> StoreResult<()> {
         unreachable!("the link marks no keys")
     }
 
     async fn delete_all_stale_one_time_kyber_pre_keys(
         &mut self,
-        _: chrono::DateTime<chrono::Utc>,
+        _: SystemTime,
         _: usize,
     ) -> StoreResult<()> {
         unreachable!("the link deletes no keys")
