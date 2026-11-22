@@ -256,18 +256,26 @@ impl AccountManager {
             )
             .await?;
 
-        let pq_last_resort_key = if has_last_resort_key {
-            if last_resort_keys.len() > 1 {
-                tracing::warn!(
-                    "More than one last resort key found; only uploading first"
-                );
-            }
-            Some(KyberPreKeyEntity::try_from(last_resort_keys[0].clone())?)
-        } else {
-            pq_last_resort_key
-                .map(KyberPreKeyEntity::try_from)
-                .transpose()?
-        };
+        // The new last-resort key, or else the one the store names current:
+        // the key `check_pre_keys` hashes. Signal-Server replaces its key with
+        // whichever it is sent, so another of the store's keys would undo a
+        // rotation and fail every later check.
+        let pq_last_resort_key = match pq_last_resort_key {
+            Some(new) => Some(new),
+            None => match protocol_store.last_resort_kyber_prekey_id().await? {
+                Some(id) => Some(protocol_store.get_kyber_pre_key(id).await?),
+                None => {
+                    if has_last_resort_key {
+                        tracing::warn!(
+                            "No stored last resort key is current; uploading none"
+                        );
+                    }
+                    None
+                },
+            },
+        }
+        .map(KyberPreKeyEntity::try_from)
+        .transpose()?;
 
         let identity_key = *identity_key_pair.identity_key();
 

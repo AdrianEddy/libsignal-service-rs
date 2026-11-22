@@ -28,6 +28,7 @@ pub trait KyberPreKeyStoreExt: KyberPreKeyStore {
         record: &KyberPreKeyRecord,
     ) -> Result<(), SignalProtocolError>;
 
+    /// Every last-resort Kyber key the store holds, in no particular order.
     async fn load_last_resort_kyber_pre_keys(
         &self,
     ) -> Result<Vec<KyberPreKeyRecord>, SignalProtocolError>;
@@ -85,6 +86,12 @@ pub trait PreKeysStore:
         &self,
     ) -> Result<Option<SignedPreKeyId>, SignalProtocolError>;
 
+    /// The current last-resort Kyber key, the one the server should hold:
+    /// [`AccountManager::check_pre_keys`] hashes it, and
+    /// [`AccountManager::update_pre_key_bundle`] uploads it.
+    ///
+    /// [`AccountManager::check_pre_keys`]: crate::AccountManager::check_pre_keys
+    /// [`AccountManager::update_pre_key_bundle`]: crate::AccountManager::update_pre_key_bundle
     async fn last_resort_kyber_prekey_id(
         &self,
     ) -> Result<Option<KyberPreKeyId>, SignalProtocolError>;
@@ -176,7 +183,12 @@ pub struct PreKeyState {
     pub signed_pre_key: SignedPreKeyEntity,
     #[serde(with = "serde_identity_key")]
     pub identity_key: IdentityKey,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Signal-Server's `SetKeysRequest` name, which it reads while it ignores
+    /// a field it doesn't know.
+    #[serde(
+        rename = "pqLastResortPreKey",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub pq_last_resort_key: Option<KyberPreKeyEntity>,
     pub pq_pre_keys: Vec<KyberPreKeyEntity>,
 }
