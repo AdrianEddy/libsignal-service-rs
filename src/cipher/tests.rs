@@ -327,3 +327,134 @@ async fn sealed_sender_certificate_is_checked_at_the_server_timestamp() {
         "{refused:?}"
     );
 }
+
+/// An unsealed envelope (PreKey, whisper or plaintext) without a source to
+/// decrypt it from, or with one that doesn't read, is an invalid frame, where
+/// the decrypt panicked. Signal-Server's sealed path queues one for anyone
+/// holding the account's access key: it checks only the key and the type's
+/// number.
+#[tokio::test]
+async fn an_identified_envelope_without_a_source_is_an_invalid_frame() {
+    let bob = address(2);
+    let (bob_store, _) = device_with_bundle(&bob).await;
+    let mut cipher = ServiceCipher::new(
+        bob_store,
+        vec![],
+        bob.clone(),
+        Rc::new(FixedClock(SystemTime::UNIX_EPOCH)),
+    );
+    let unreadable = [
+        (None, None),
+        (Some("not a service id".to_owned()), None),
+        (None, Some(vec![0x5a; 3])),
+    ];
+    for kind in [
+        Type::PrekeyMessage,
+        Type::DoubleRatchet,
+        Type::PlaintextContent,
+    ] {
+        for (source, source_binary) in unreadable.clone() {
+            let envelope = Envelope {
+                r#type: Some(kind.into()),
+                source_service_id: source,
+                source_service_id_binary: source_binary,
+                source_device_id: Some(1),
+                destination_service_id: Some(bob.name().to_owned()),
+                client_timestamp: Some(1_700_000_000_000),
+                server_timestamp: Some(1_700_000_000_001),
+                content: Some(vec![0x33; 64].into()),
+                ..Default::default()
+            };
+            match cipher.decrypt(&envelope, &mut rand::rng()).await {
+                Err(ServiceError::InvalidFrame { reason }) => assert_eq!(
+                    reason,
+                    "an identified envelope without a valid source service id",
+                    "{kind:?}"
+                ),
+                Err(error) => panic!("{kind:?}: {error:?}"),
+                Ok(_) => panic!("{kind:?}: decrypted"),
+            }
+        }
+    }
+}
+
+/// A sender certificate whose sender isn't a UUID, though a trust root
+/// signed it, is an invalid sealed-sender message, where the decrypt
+/// panicked.
+#[tokio::test]
+async fn a_sealed_sender_that_isnt_a_uuid_is_refused() {
+    let rng = &mut rand::rng();
+    let (alice, bob) = (address(1), address(2));
+    let (bob_store, bob_bundle) = device_with_bundle(&bob).await;
+    let alice_identity = IdentityKeyPair::generate(rng);
+    let mut alice_store =
+        InMemSignalProtocolStore::new(alice_identity, 1).unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    process_prekey_bundle(
+        &bob,
+        &alice,
+        &mut alice_store.session_store,
+        &mut alice_store.identity_store,
+        &bob_bundle,
+        now,
+        rng,
+    )
+    .await
+    .unwrap();
+    let trust_root = KeyPair::generate(rng);
+    let server_key = KeyPair::generate(rng);
+    let certificate = SenderCertificate::new(
+        "not a uuid".to_owned(),
+        None,
+        *alice_identity.public_key(),
+        alice.device_id(),
+        Timestamp::from_epoch_millis(1_800_000_000_000),
+        ServerCertificate::new(
+            1,
+            server_key.public_key,
+            &trust_root.private_key,
+            rng,
+        )
+        .unwrap(),
+        &server_key.private_key,
+        rng,
+    )
+    .unwrap();
+    let sealed = sealed_sender_encrypt(
+        &bob,
+        &certificate,
+        &add_padding(4, &[]).unwrap(),
+        &mut alice_store.session_store,
+        &mut alice_store.identity_store,
+        now,
+        rng,
+    )
+    .await
+    .unwrap();
+    let envelope = Envelope {
+        r#type: Some(Type::UnidentifiedSender.into()),
+        destination_service_id: Some(bob.name().to_owned()),
+        client_timestamp: Some(1_700_000_000_000),
+        server_timestamp: Some(1_700_000_000_000),
+        content: Some(sealed.into()),
+        ..Default::default()
+    };
+    let mut cipher = ServiceCipher::new(
+        bob_store,
+        vec![trust_root.public_key],
+        bob,
+        Rc::new(FixedClock(now)),
+    );
+    match cipher.decrypt(&envelope, rng).await {
+        Err(ServiceError::SealedSenderDecryptionError(error)) => assert!(
+            matches!(
+                &error.inner,
+                SignalProtocolError::InvalidSealedSenderMessage(reason)
+                    if reason == "invalid sender UUID"
+            ),
+            "{error:?}"
+        ),
+        Err(error) => panic!("{error:?}"),
+        Ok(_) => panic!("decrypted"),
+    }
+}

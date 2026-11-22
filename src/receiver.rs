@@ -1,9 +1,10 @@
 use std::{future::Future, rc::Rc};
 
+use aes::cipher::block_padding;
 use bytes::{Buf, Bytes};
 
 use crate::{
-    attachment_cipher::decrypt_in_place,
+    attachment_cipher::{decrypt_in_place, AttachmentCipherError},
     configuration::ServiceCredentials,
     messagepipe::MessagePipe,
     models::{Contact, ParseContactError},
@@ -58,6 +59,13 @@ impl MessageReceiver {
         Ok((MessagePipe::from_socket(ws), task))
     }
 
+    /// Downloads and decrypts the contacts blob of a primary device's
+    /// `SyncMessage.Contacts`, and iterates over its contacts.
+    ///
+    /// A blob whose key isn't 64 bytes, whose download fails, or that doesn't
+    /// decrypt is an error. The iterator yields a contact that doesn't parse
+    /// as an error and goes on; an entry that breaks the blob's framing ends
+    /// it after its error, since nothing after it can be found.
     pub async fn retrieve_contacts(
         &mut self,
         contacts: &crate::proto::sync_message::Contacts,
@@ -67,6 +75,12 @@ impl MessageReceiver {
     > {
         if let Some(ref blob) = contacts.blob {
             use futures::io::AsyncReadExt;
+
+            let key: [u8; 64] = blob.key().try_into().map_err(|_| {
+                ServiceError::InvalidFrame {
+                    reason: "an attachment key that isn't 64 bytes",
+                }
+            })?;
 
             const MAX_DOWNLOAD_RETRIES: u8 = 3;
             let mut retries = 0;
@@ -89,22 +103,14 @@ impl MessageReceiver {
             };
 
             let mut ciphertext = Vec::new();
-            stream
-                .read_to_end(&mut ciphertext)
-                .await
-                .expect("streamed attachment");
+            stream.read_to_end(&mut ciphertext).await?;
 
-            let key_material = blob.key();
-            assert_eq!(
-                key_material.len(),
-                64,
-                "key material for attachments is ought to be 64 bytes"
-            );
-            let mut key = [0u8; 64];
-            key.copy_from_slice(key_material);
-
-            decrypt_in_place(key, &mut ciphertext)
-                .expect("attachment decryption");
+            decrypt_in_place(key, &mut ciphertext).map_err(|e| match e {
+                AttachmentCipherError::MacError => ServiceError::MacError,
+                AttachmentCipherError::PaddingError => {
+                    ServiceError::Padding(block_padding::Error)
+                },
+            })?;
 
             Ok(DeviceContactsIterator::new(Bytes::from(ciphertext)))
         } else {
@@ -134,17 +140,30 @@ impl Iterator for DeviceContactsIterator {
             return None;
         }
 
+        // An entry that breaks the framing leaves the next one nowhere to be
+        // found: its error ends the iteration.
         let contact_details: ContactDetails =
-            prost::Message::decode_length_delimited(&mut self.decrypted_buffer)
-                .map_err(ParseContactError::Protobuf)
-                .ok()?;
+            match prost::Message::decode_length_delimited(
+                &mut self.decrypted_buffer,
+            ) {
+                Ok(contact_details) => contact_details,
+                Err(e) => {
+                    self.decrypted_buffer.clear();
+                    return Some(Err(ParseContactError::Protobuf(e)));
+                },
+            };
 
         let avatar_data = if let Some(Avatar {
             length: Some(length),
             ..
         }) = contact_details.avatar
         {
-            Some(self.decrypted_buffer.copy_to_bytes(length as usize))
+            let length = length as usize;
+            if length > self.decrypted_buffer.remaining() {
+                self.decrypted_buffer.clear();
+                return Some(Err(ParseContactError::TruncatedAvatar));
+            }
+            Some(self.decrypted_buffer.copy_to_bytes(length))
         } else {
             None
         };

@@ -323,7 +323,7 @@ pub fn decrypt_group(
     let group_master_key = GroupMasterKey::new(
         master_key_bytes
             .try_into()
-            .expect("wrong master key bytes length"),
+            .map_err(|_| GroupDecodingError::WrongBlob)?,
     );
     let group_secret_params =
         GroupSecretParams::derive_from_master_key(group_master_key);

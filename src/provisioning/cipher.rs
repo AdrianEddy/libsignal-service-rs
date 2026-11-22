@@ -15,10 +15,7 @@ use sha2::Sha256;
 
 pub use crate::proto::{ProvisionEnvelope, ProvisionMessage};
 
-use crate::{
-    envelope::{CIPHER_KEY_SIZE, IV_LENGTH, IV_OFFSET},
-    provisioning::ProvisioningError,
-};
+use crate::{envelope::IV_LENGTH, provisioning::ProvisioningError};
 
 enum CipherMode {
     DecryptAndEncrypt(KeyPair),
@@ -50,6 +47,8 @@ impl CipherMode {
 }
 
 const VERSION: u8 = 1;
+/// An HMAC-SHA256.
+const MAC_LENGTH: usize = 32;
 
 #[derive(Debug)]
 pub struct ProvisioningCipher {
@@ -125,23 +124,30 @@ impl ProvisioningCipher {
             },
         };
         let master_ephemeral = PublicKey::deserialize(
-            &provision_envelope.public_key.expect("no public key"),
+            &provision_envelope
+                .public_key
+                .ok_or(ProvisioningError::MissingPublicKey)?,
         )
         .map_err(ProvisioningError::invalid_public_key)?;
         let body = provision_envelope
             .body
-            .expect("no body in ProvisionMessage");
-        if body[0] != VERSION {
+            .ok_or(ProvisioningError::MissingMessage)?;
+
+        // The version, the IV, the ciphertext and the MAC of the three, as
+        // `encrypt` writes them: a body too short to hold an IV and a MAC
+        // can't verify.
+        let (&version, body) = body
+            .split_first()
+            .ok_or(ProvisioningError::BadVersionNumber)?;
+        if version != VERSION {
             return Err(ProvisioningError::BadVersionNumber);
         }
-
-        let iv: &[u8; IV_LENGTH] = body[IV_OFFSET..(IV_LENGTH + IV_OFFSET)]
-            .try_into()
-            .expect("fixed-size range");
-        let mac = &body[(body.len() - 32)..];
-        let cipher_text = &body[16 + 1..(body.len() - CIPHER_KEY_SIZE)];
-        let iv_and_cipher_text = &body[0..(body.len() - CIPHER_KEY_SIZE)];
-        debug_assert_eq!(mac.len(), 32);
+        let (iv, body) = body
+            .split_first_chunk::<IV_LENGTH>()
+            .ok_or(ProvisioningError::MismatchedMac)?;
+        let (cipher_text, mac) = body
+            .split_last_chunk::<MAC_LENGTH>()
+            .ok_or(ProvisioningError::MismatchedMac)?;
 
         let agreement = key_pair
             .calculate_agreement(&master_ephemeral)
@@ -156,12 +162,12 @@ impl ProvisioningCipher {
 
         let mut verifier = Hmac::<Sha256>::new_from_slice(parts2)
             .expect("HMAC can take any size key");
-        verifier.update(iv_and_cipher_text);
-        let our_mac = verifier.finalize().into_bytes();
-        debug_assert_eq!(our_mac.len(), mac.len());
-        if &our_mac[..32] != mac {
-            return Err(ProvisioningError::MismatchedMac);
-        }
+        verifier.update(&[version]);
+        verifier.update(iv);
+        verifier.update(cipher_text);
+        verifier
+            .verify_slice(mac)
+            .map_err(|_| ProvisioningError::MismatchedMac)?;
 
         // libsignal-service-java uses Pkcs5,
         // but that should not matter.

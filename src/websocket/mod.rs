@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::channel::{mpsc, oneshot};
 use futures::prelude::*;
 use futures::stream::{FusedStream, FuturesUnordered};
-use http::{HeaderMap, Method, StatusCode};
+use http::{HeaderMap, Method};
 use tracing::debug;
 
 use crate::prelude::PushService;
@@ -261,16 +261,12 @@ impl SignalWebSocketProcess {
                     } else if let Some(_x) =
                         self.outgoing_keep_alive_set.take(&id)
                     {
-                        let status =
-                            StatusCode::from_u16(response.status() as _)
-                                .map_err(|e| {
-                                    ServiceError::IO(std::io::Error::other(
-                                        format!(
-                                            "invalid http status code {} - {e}",
-                                            response.status()
-                                        ),
-                                    ))
-                                })?;
+                        let status = response
+                            .status_code()
+                            .ok_or(ServiceError::InvalidFrame {
+                            reason:
+                                "a keepalive response without a valid status",
+                        })?;
                         if !status.is_success() {
                             return Err(ServiceError::UnhandledResponseCode {
                                 status,

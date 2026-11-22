@@ -1,5 +1,3 @@
-use std::convert::TryInto;
-
 use aes_gcm::{aead::Aead, AeadInOut, Aes256Gcm, KeyInit};
 use rand::{CryptoRng, RngCore};
 use zkgroup::profiles::ProfileKey;
@@ -110,14 +108,15 @@ impl ProfileCipher {
         &self,
         bytes: impl AsRef<[u8]>,
     ) -> Result<Vec<u8>, ProfileCipherError> {
-        let bytes = bytes.as_ref();
-        let nonce: [u8; 12] = bytes[0..12]
-            .try_into()
-            .expect("fixed length nonce material");
+        // A ciphertext without room for its nonce doesn't decrypt either.
+        let (&nonce, ciphertext) = bytes
+            .as_ref()
+            .split_first_chunk::<12>()
+            .ok_or(ProfileCipherError::EncryptionError)?;
         let cipher = Aes256Gcm::new(&self.profile_key.get_bytes().into());
 
         let mut plaintext = cipher
-            .decrypt(&nonce.into(), &bytes[12..])
+            .decrypt(&nonce.into(), ciphertext)
             .map_err(|_| ProfileCipherError::EncryptionError)?;
 
         // Unpad

@@ -19,7 +19,7 @@ where
     T: DeserializeOwned,
     R: SignalServiceResponse,
 {
-    let status = response.status_code();
+    let status = response.status_code()?;
     let body = response.text().await?;
     serde_json::from_str(&body).map_err(move |error| {
         tracing::error!(%error, "JSON decoding in error handling failed; returning UnhandledResponseCode");
@@ -50,7 +50,7 @@ async fn baseline_decode<R>(response: R) -> Result<R, ServiceError>
 where
     R: SignalServiceResponse,
 {
-    match response.status_code() {
+    match response.status_code()? {
         StatusCode::OK
         | StatusCode::CREATED
         | StatusCode::ACCEPTED
@@ -99,7 +99,7 @@ where
 macro_rules! error_mapper {
     // tt-muncher: accumulate `pattern => body` arms, then emit one match.
     (@munch $response:ident; [$($out:tt)*] ;) => {
-        match $response.status_code() {
+        match $response.status_code()? {
             $($out)*
             _ => Ok($response),
         }
@@ -170,7 +170,10 @@ where
 
 /// A response from the chat service, over HTTP or the WebSocket.
 pub(crate) trait SignalServiceResponse: Sized {
-    fn status_code(&self) -> StatusCode;
+    /// The response's status. A WebSocket response without a valid one is
+    /// [`InvalidFrame`](ServiceError::InvalidFrame): no status is no answer,
+    /// and read as 200 it would pass for a success.
+    fn status_code(&self) -> Result<StatusCode, ServiceError>;
 
     fn header(&self, name: &str) -> Option<&str>;
 
@@ -205,8 +208,8 @@ pub(crate) trait SignalServiceResponse: Sized {
 }
 
 impl SignalServiceResponse for HttpResponse {
-    fn status_code(&self) -> StatusCode {
-        self.status
+    fn status_code(&self) -> Result<StatusCode, ServiceError> {
+        Ok(self.status)
     }
 
     fn header(&self, name: &str) -> Option<&str> {
@@ -304,8 +307,12 @@ impl HttpResponse {
 }
 
 impl SignalServiceResponse for WebSocketResponseMessage {
-    fn status_code(&self) -> StatusCode {
-        StatusCode::from_u16(self.status() as u16).unwrap_or_default()
+    fn status_code(&self) -> Result<StatusCode, ServiceError> {
+        WebSocketResponseMessage::status_code(self).ok_or(
+            ServiceError::InvalidFrame {
+                reason: "a response without a valid status",
+            },
+        )
     }
 
     async fn json<U: DeserializeOwned>(self) -> Result<U, ServiceError> {

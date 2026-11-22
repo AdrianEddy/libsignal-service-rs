@@ -195,7 +195,7 @@ impl SignalWebSocket<websocket::Identified> {
             device_id
         );
 
-        let mut pre_key_response: PreKeyResponse = self
+        let pre_key_response: PreKeyResponse = self
             .http_request(Method::GET, path)?
             .send()
             .await?
@@ -204,10 +204,12 @@ impl SignalWebSocket<websocket::Identified> {
             .json()
             .await?;
 
-        assert!(!pre_key_response.devices.is_empty());
-
         let identity = IdentityKey::decode(&pre_key_response.identity_key)?;
-        let device = pre_key_response.devices.remove(0);
+        let device = pre_key_response.devices.into_iter().next().ok_or(
+            ServiceError::InvalidFrame {
+                reason: "a prekey answer without devices",
+            },
+        )?;
         device.into_bundle(identity)
     }
 

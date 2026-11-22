@@ -28,28 +28,6 @@ impl Envelope {
         self.story.unwrap_or(false)
     }
 
-    #[deprecated = "use parse_source_service_id"]
-    pub fn source_address(&self) -> ServiceId {
-        match self.source_service_id.as_deref() {
-            Some(service_id) => {
-                ServiceId::parse_from_service_id_string(service_id)
-                    .expect("invalid source ProtocolAddress UUID or prefix")
-            },
-            None => panic!("source_service_id is set"),
-        }
-    }
-
-    #[deprecated = "use parse_destination_service_id"]
-    pub fn destination_address(&self) -> ServiceId {
-        match self.destination_service_id.as_deref() {
-            Some(service_id) => ServiceId::parse_from_service_id_string(
-                service_id,
-            )
-            .expect("invalid destination ProtocolAddress UUID or prefix"),
-            None => panic!("destination_address is set"),
-        }
-    }
-
     pub fn parse_destination_service_id(&self) -> Option<ServiceId> {
         crate::utils::parse_service_id_with_fallback(
             self.destination_service_id_binary.as_deref(),
@@ -82,9 +60,4 @@ impl Envelope {
     }
 }
 
-pub(crate) const CIPHER_KEY_SIZE: usize = 32;
-
-pub(crate) const VERSION_OFFSET: usize = 0;
-pub(crate) const VERSION_LENGTH: usize = 1;
-pub(crate) const IV_OFFSET: usize = VERSION_OFFSET + VERSION_LENGTH;
 pub(crate) const IV_LENGTH: usize = 16;

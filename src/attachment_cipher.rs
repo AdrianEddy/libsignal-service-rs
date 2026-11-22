@@ -54,7 +54,8 @@ pub fn encrypt_in_place(iv: [u8; 16], key: [u8; 64], plaintext: &mut Vec<u8>) {
 
 /// Decrypts an attachment in place, given the key material.
 ///
-/// On error, ciphertext is not changed.
+/// On error, ciphertext is not changed. One too short to hold a MAC is a
+/// [`AttachmentCipherError::MacError`].
 #[tracing::instrument(skip(key, ciphertext))]
 pub fn decrypt_in_place(
     key: [u8; 64],
@@ -63,9 +64,9 @@ pub fn decrypt_in_place(
     let key: &Array<u8, U64> = (&key).into();
     let (aes_half, mac_half) = key.split_ref::<U32>();
 
-    let ciphertext_len = ciphertext.len();
-
-    let (buffer, their_mac) = ciphertext.split_at_mut(ciphertext_len - 32);
+    let (buffer, their_mac) = ciphertext
+        .split_last_chunk_mut::<32>()
+        .ok_or(AttachmentCipherError::MacError)?;
 
     // Compute and append MAC
     let mut mac = Hmac::<Sha256>::new_from_slice(mac_half)

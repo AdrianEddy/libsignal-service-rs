@@ -72,6 +72,16 @@ fn debug_envelope(envelope: &Envelope) -> String {
     }
 }
 
+/// An unsealed envelope is decrypted from its sender's session, so one without
+/// a source to read it from can't be opened. Signal-Server queues one for
+/// anyone holding the recipient's access key (its sealed path checks only the
+/// key and the type's number), and Signal-Desktop drops it.
+fn missing_source() -> ServiceError {
+    ServiceError::InvalidFrame {
+        reason: "an identified envelope without a valid source service id",
+    }
+}
+
 impl<S> ServiceCipher<S>
 where
     S: ProtocolStore + SenderKeyStore + SessionStoreExt + Clone,
@@ -373,8 +383,8 @@ where
         use crate::proto::envelope::Type;
         let parts = match envelope.r#type() {
             Type::PrekeyMessage => {
-                let source_service_id = source_service_id
-                    .expect("prekey bundle format contains source_service_id");
+                let source_service_id =
+                    source_service_id.ok_or_else(missing_source)?;
                 let sender_device = envelope.source_device_id().try_into()?;
                 let sender = get_preferred_protocol_address(
                     &self.protocol_store,
@@ -409,8 +419,8 @@ where
             },
             Type::PlaintextContent => {
                 tracing::warn!(?envelope, "Envelope with plaintext content.  This usually indicates a decryption retry.");
-                let source_service_id = source_service_id
-                    .expect("prekey bundle format contains source_service_id");
+                let source_service_id =
+                    source_service_id.ok_or_else(missing_source)?;
                 // Unsealed envelope wrapping a PlaintextContent.
                 // Should contain a DecryptionErrorMessage.
                 let plaintext_content =
@@ -427,8 +437,8 @@ where
                 }
             },
             Type::DoubleRatchet => {
-                let source_service_id = source_service_id
-                    .expect("prekey bundle format contains source_service_id");
+                let source_service_id =
+                    source_service_id.ok_or_else(missing_source)?;
                 let sender_device = envelope.source_device_id().try_into()?;
                 let sender = get_preferred_protocol_address(
                     &self.protocol_store,
@@ -778,13 +788,13 @@ async fn sealed_sender_decrypt<R: Rng + CryptoRng>(
     let local_service_id =
         ServiceId::parse_from_service_id_string(local_address.name())
             .expect("valid protocol address name");
-    let is_local_uuid = local_service_id.raw_uuid()
-        == usmc
-            .sender()?
-            .sender_uuid()?
-            .parse::<Uuid>()
-            // Validity checked inside certificate checker
-            .expect("valid uuid");
+    let sender_uuid: Uuid =
+        usmc.sender()?.sender_uuid()?.parse().map_err(|_| {
+            SignalProtocolError::InvalidSealedSenderMessage(
+                "invalid sender UUID".to_string(),
+            )
+        })?;
+    let is_local_uuid = local_service_id.raw_uuid() == sender_uuid;
 
     let is_local_e164 = match (local_e164, usmc.sender()?.sender_e164()?) {
         (Some(l), Some(s)) => l == s,
