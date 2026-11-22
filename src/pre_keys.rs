@@ -197,6 +197,14 @@ pub(crate) const PRE_KEY_MINIMUM: u32 = 10;
 pub(crate) const PRE_KEY_BATCH_SIZE: u32 = 100;
 pub(crate) const PRE_KEY_MEDIUM_MAX_VALUE: u32 = 0xFFFFFF;
 
+/// Id `i` of a batch numbered from `offset`: `offset + i + 1` in the cycle of
+/// prekey ids, 1 to `PRE_KEY_MEDIUM_MAX_VALUE - 1`, which wraps from its last
+/// id to 1. No `offset` or `i` overflows.
+fn batch_pre_key_id(offset: u32, i: u32) -> u32 {
+    let cycle = PRE_KEY_MEDIUM_MAX_VALUE - 1;
+    (offset % cycle + i % cycle) % cycle + 1
+}
+
 /// A Kyber1024 prekey signed by `identity_key_pair`, created at `timestamp`,
 /// with its key pair and signature drawn from `csprng`.
 ///
@@ -250,9 +258,7 @@ pub async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
     // EC keys
     for i in 0..pre_key_count {
         let key_pair = KeyPair::generate(csprng);
-        let pre_key_id =
-            (((pre_keys_offset_id + i) % (PRE_KEY_MEDIUM_MAX_VALUE - 1)) + 1)
-                .into();
+        let pre_key_id = batch_pre_key_id(pre_keys_offset_id, i).into();
         let pre_key_record = PreKeyRecord::new(pre_key_id, &key_pair);
         protocol_store
                     .save_pre_key(pre_key_id, &pre_key_record)
@@ -266,10 +272,7 @@ pub async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
 
     // Kyber keys
     for i in 0..kyber_pre_key_count {
-        let pre_key_id = (((pq_pre_keys_offset_id + i)
-            % (PRE_KEY_MEDIUM_MAX_VALUE - 1))
-            + 1)
-        .into();
+        let pre_key_id = batch_pre_key_id(pq_pre_keys_offset_id, i).into();
         let pre_key_record =
             generate_kyber_pre_key(pre_key_id, identity_key_pair, now, csprng)?;
         protocol_store
@@ -304,17 +307,9 @@ pub async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
                     .instrument(tracing::trace_span!(parent: &span, "save signed pre key", signed_pre_key_id = ?next_signed_pre_key_id)).await?;
 
     let pq_last_resort_key = if use_last_resort_key {
-        let pre_key_id = (((pq_pre_keys_offset_id + kyber_pre_key_count)
-            % (PRE_KEY_MEDIUM_MAX_VALUE - 1))
-            + 1)
-        .into();
-
-        if !pq_pre_keys.is_empty() {
-            assert_eq!(
-                u32::from(pq_pre_keys.last().unwrap().id()?) + 1,
-                u32::from(pre_key_id)
-            );
-        }
+        // The id after the batch's last one-time Kyber key.
+        let pre_key_id =
+            batch_pre_key_id(pq_pre_keys_offset_id, kyber_pre_key_count).into();
 
         let pre_key_record =
             generate_kyber_pre_key(pre_key_id, identity_key_pair, now, csprng)?;
