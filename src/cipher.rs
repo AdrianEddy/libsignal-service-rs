@@ -107,9 +107,9 @@ where
     /// content decoded from it.
     ///
     /// `Ok(None)` for an envelope without content, and for content that isn't
-    /// passed on: a plaintext envelope that isn't a decryption error, a
-    /// decryption error that doesn't decode, or a sync message that doesn't
-    /// come from our own ACI.
+    /// passed on: a plaintext, sealed or not, that holds anything but a
+    /// decryption error alone, a decryption error that doesn't decode, or a
+    /// sync message that doesn't come from our own ACI.
     ///
     /// The plaintext is the `Content` as its sender serialized it, unpadded,
     /// side-cars and the fields this crate's protos don't know included, so a
@@ -126,6 +126,9 @@ where
     /// A PNI signature is verified during decryption and, when valid, its
     /// PNI is exposed as `Metadata::pni_verified`, on a message without a
     /// `body` too.
+    ///
+    /// A plaintext's side-cars are never taken: no session authenticates
+    /// them.
     ///
     /// **NOTE**: must process `Metadata::pni_verified` to confirm the sender's
     /// PNI, not the raw side-car message.
@@ -153,6 +156,34 @@ where
 
         tracing::Span::current()
             .record("envelope_metadata", tracing::field::display(&metadata));
+
+        // A plaintext, sealed or not, is authenticated by no session, only by
+        // the server's word (an unsealed one's source, a sealed one's sender
+        // certificate), so it may carry a decryption error alone, and no
+        // side-car (Signal-Android's `EnvelopeContentValidator`). This runs
+        // before the side-cars are applied, so a plaintext's never are.
+        if metadata.was_plaintext {
+            let crate::proto::Content {
+                content:
+                    Some(crate::proto::content::Content::DecryptionErrorMessage(
+                        dme,
+                    )),
+                sender_key_distribution_message: None,
+                pni_signature_message: None,
+            } = &message
+            else {
+                tracing::error!(
+                    ?envelope,
+                    "Received a plaintext envelope that isn't a decryption error alone."
+                );
+                return Ok(None);
+            };
+            tracing::warn!(
+                ?envelope,
+                len = dme.len(),
+                "Received a decryption error message."
+            );
+        }
 
         // Ingest side-car messages *before* processing content (which possibly triggers an early `return Ok(None)`)
 
@@ -190,26 +221,6 @@ where
 
         // Now, process actual content, *after* side-car messages such as SKDM or PNI
         // signatures.
-
-        // Sanity test: if the envelope was plaintext, the message should *only* be a
-        // decryption failure error
-        if metadata.was_plaintext {
-            let Some(crate::proto::content::Content::DecryptionErrorMessage(
-                dme,
-            )) = &message.content
-            else {
-                tracing::error!(
-                    ?envelope,
-                    "Received a plaintext envelope with a non-decryption error message."
-                );
-                return Ok(None);
-            };
-            tracing::warn!(
-                ?envelope,
-                len = dme.len(),
-                "Received a decryption error message."
-            );
-        }
 
         // Filter out SyncMessages that don't come from our own ACI.
         if matches!(
@@ -508,12 +519,15 @@ where
                 }
             },
             Type::UnidentifiedSender => {
-                let SealedSenderDecryptionResult {
-                    sender_uuid,
-                    sender_e164: _,
-                    device_id,
-                    mut message,
-                } = sealed_sender_decrypt(
+                let (
+                    SealedSenderDecryptionResult {
+                        sender_uuid,
+                        sender_e164: _,
+                        device_id,
+                        mut message,
+                    },
+                    message_type,
+                ) = sealed_sender_decrypt(
                     ciphertext,
                     &self.trust_roots,
                     // When the server took the message, as Desktop and
@@ -566,7 +580,12 @@ where
                     data: message,
                     sender,
                     sender_device: device_id,
-                    was_plaintext: false,
+                    // A sealed `PlaintextContent` is no more authenticated
+                    // than an unsealed one: no session encrypts it, and its
+                    // certificate is the server's word. Signal-Desktop reads
+                    // it as not encrypted, Signal-Android by its inner type.
+                    was_plaintext: message_type
+                        == CiphertextMessageType::Plaintext,
                     unidentified_sender: true,
                     needs_receipt,
                 }
@@ -580,11 +599,18 @@ where
         };
 
         let message = crate::proto::Content::decode(parts.data.as_slice())?;
-        let pni_verified = if let Some(msg) = &message.pni_signature_message {
-            self.verify_pni_signature(parts.sender, parts.sender_device, msg)
+        // A plaintext's side-car is never taken (`open_envelope`), so it
+        // isn't verified either.
+        let pni_verified = match &message.pni_signature_message {
+            Some(msg) if !parts.was_plaintext => {
+                self.verify_pni_signature(
+                    parts.sender,
+                    parts.sender_device,
+                    msg,
+                )
                 .await
-        } else {
-            None
+            },
+            _ => None,
         };
         let metadata = Metadata {
             destination: destination_service_id,
@@ -790,6 +816,9 @@ impl From<SignalProtocolError> for SealedSenderDecryptionError {
 /// the embedded [`SenderCertificate`]. The sender certificate (signed by the [`ServerCertificate`])
 /// is then validated against the `trust_root` baked into the client to ensure that the sender's
 /// identity was not forged.
+///
+/// The inner message's type comes back with it: a `Plaintext` one is a `PlaintextContent`'s
+/// body, which no session authenticates.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     skip(
@@ -820,7 +849,10 @@ async fn sealed_sender_decrypt<R: Rng + CryptoRng>(
     sender_key_store: &mut dyn SenderKeyStore,
     kyber_pre_key_store: &mut dyn KyberPreKeyStore,
     csprng: &mut R,
-) -> Result<SealedSenderDecryptionResult, SealedSenderDecryptionError> {
+) -> Result<
+    (SealedSenderDecryptionResult, CiphertextMessageType),
+    SealedSenderDecryptionError,
+> {
     let usmc =
         sealed_sender_decrypt_to_usmc(ciphertext, identity_store).await?;
 
@@ -860,6 +892,7 @@ async fn sealed_sender_decrypt<R: Rng + CryptoRng>(
         usmc.sender()?.sender_uuid()?.to_string(),
         usmc.sender()?.sender_device_id()?,
     );
+    let message_type = usmc.msg_type()?;
 
     sealed_sender_decrypt_with_validated_usmc(
         &usmc,
@@ -874,6 +907,7 @@ async fn sealed_sender_decrypt<R: Rng + CryptoRng>(
         csprng,
     )
     .await
+    .map(|result| (result, message_type))
     .map_err(|inner| SealedSenderDecryptionError {
         inner,
         sender: Some(remote_address),

@@ -8,11 +8,13 @@ use base64::prelude::*;
 use futures::future::{self, FutureExt as _, LocalBoxFuture};
 use libsignal_protocol::{
     create_sender_key_distribution_message, kem, process_prekey_bundle,
-    sealed_sender_encrypt, Aci, DeviceId, GenericSignedPreKey as _,
-    IdentityKeyPair, InMemSignalProtocolStore, KeyPair, KyberPreKeyRecord,
-    KyberPreKeyStore as _, PreKeyBundle, ProtocolAddress, SenderCertificate,
-    SenderKeyStore as _, ServerCertificate, ServiceId, SignalProtocolError,
-    SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp,
+    sealed_sender_encrypt, sealed_sender_encrypt_from_usmc, Aci,
+    CiphertextMessageType, ContentHint, DeviceId, GenericSignedPreKey as _,
+    IdentityKeyPair, IdentityKeyStore as _, InMemSignalProtocolStore, KeyPair,
+    KyberPreKeyRecord, KyberPreKeyStore as _, PreKeyBundle, ProtocolAddress,
+    SenderCertificate, SenderKeyStore as _, ServerCertificate, ServiceId,
+    SignalProtocolError, SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp,
+    UnidentifiedSenderMessageContent,
 };
 use prost::Message as _;
 use uuid::Uuid;
@@ -558,6 +560,195 @@ async fn sealed_sender_certificate_is_checked_at_the_server_timestamp() {
         ),
         "{refused:?}"
     );
+}
+
+/// A `Content` holding a decryption error alone.
+fn decryption_error() -> proto::Content {
+    proto::Content {
+        content: Some(proto::content::Content::DecryptionErrorMessage(
+            proto::DecryptionErrorMessage {
+                timestamp: Some(1_700_000_000_000),
+                device_id: Some(1),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )),
+        ..Default::default()
+    }
+}
+
+/// `content` as a serialized `PlaintextContent`, as libsignal makes one:
+/// its marker byte, the content and the padding boundary.
+fn plaintext_content(content: &proto::Content) -> Vec<u8> {
+    [&[0xc0][..], &content.encode_to_vec(), &[0x80]].concat()
+}
+
+/// Bob's cipher, and Alice's `PlaintextContent` of `content` to him in an
+/// unsealed envelope, whose source only the server vouches for.
+async fn unsealed_plaintext(
+    content: &proto::Content,
+) -> (ServiceCipher<InMemSignalProtocolStore>, Envelope) {
+    let bob = address(2);
+    let (bob_store, _) = device_with_bundle(&bob).await;
+    let envelope = Envelope {
+        r#type: Some(Type::PlaintextContent.into()),
+        source_service_id: Some(address(1).name().to_owned()),
+        source_device_id: Some(1),
+        destination_service_id: Some(bob.name().to_owned()),
+        client_timestamp: Some(1_700_000_000_000),
+        server_timestamp: Some(1_700_000_000_001),
+        content: Some(plaintext_content(content).into()),
+        ..Default::default()
+    };
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let clock = Rc::new(FixedClock(now));
+    (ServiceCipher::new(bob_store, vec![], bob, clock), envelope)
+}
+
+/// Bob's cipher, which trusts the root of Alice's sender certificate, and
+/// Alice's `PlaintextContent` of `content` to him in a sealed envelope: a
+/// sealed-sender message of the plaintext type, which no session encrypts.
+async fn sealed_plaintext(
+    content: &proto::Content,
+) -> (ServiceCipher<InMemSignalProtocolStore>, Envelope) {
+    let rng = &mut rand::rng();
+    let (alice, bob) = (address(1), address(2));
+    let (bob_store, bob_bundle) = device_with_bundle(&bob).await;
+    let alice_identity = IdentityKeyPair::generate(rng);
+    let mut alice_store =
+        InMemSignalProtocolStore::new(alice_identity, 1).unwrap();
+    alice_store
+        .save_identity(&bob, bob_bundle.identity_key().unwrap())
+        .await
+        .unwrap();
+    let trust_root = KeyPair::generate(rng);
+    let server_key = KeyPair::generate(rng);
+    let certificate = SenderCertificate::new(
+        alice.name().to_owned(),
+        None,
+        *alice_identity.public_key(),
+        alice.device_id(),
+        Timestamp::from_epoch_millis(1_800_000_000_000),
+        ServerCertificate::new(
+            1,
+            server_key.public_key,
+            &trust_root.private_key,
+            rng,
+        )
+        .unwrap(),
+        &server_key.private_key,
+        rng,
+    )
+    .unwrap();
+    let usmc = UnidentifiedSenderMessageContent::new(
+        CiphertextMessageType::Plaintext,
+        certificate,
+        plaintext_content(content),
+        ContentHint::Default,
+        None,
+    )
+    .unwrap();
+    let sealed =
+        sealed_sender_encrypt_from_usmc(&bob, &usmc, &alice_store, rng)
+            .await
+            .unwrap();
+    let envelope = Envelope {
+        r#type: Some(Type::UnidentifiedSender.into()),
+        destination_service_id: Some(bob.name().to_owned()),
+        client_timestamp: Some(1_700_000_000_000),
+        server_timestamp: Some(1_700_000_000_001),
+        content: Some(sealed.into()),
+        ..Default::default()
+    };
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let clock = Rc::new(FixedClock(now));
+    let cipher =
+        ServiceCipher::new(bob_store, vec![trust_root.public_key], bob, clock);
+    (cipher, envelope)
+}
+
+/// A plaintext in a sealed envelope is a plaintext, as Signal-Desktop reads
+/// it and Signal-Android by its inner type: no session authenticates it, so
+/// it is passed on only as a decryption error, where whatever it held passed
+/// for a message from its certificate's sender.
+#[tokio::test]
+async fn a_sealed_plaintext_is_passed_on_only_as_a_decryption_error() {
+    let forged = proto::Content {
+        content: Some(proto::content::Content::DataMessage(
+            proto::DataMessage {
+                body: Some("forged".into()),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    let (mut bob, envelope) = sealed_plaintext(&forged).await;
+    let opened = bob.open_envelope(&envelope, &mut rand::rng()).await;
+    assert!(matches!(opened, Ok(None)), "{opened:?}");
+
+    let (mut bob, envelope) = sealed_plaintext(&decryption_error()).await;
+    let opened = bob
+        .open_envelope(&envelope, &mut rand::rng())
+        .await
+        .unwrap()
+        .expect("a decryption error");
+    assert!(
+        matches!(opened.body, Some(ContentBody::DecryptionErrorMessage(_))),
+        "{:?}",
+        opened.body
+    );
+    assert!(opened.metadata.was_plaintext);
+    assert!(opened.metadata.unidentified_sender);
+    assert_eq!(
+        opened.metadata.sender.service_id_string(),
+        address(1).name()
+    );
+}
+
+/// A plaintext, sealed or not, that carries a side-car beside its decryption
+/// error is dropped, and its sender key distribution isn't applied: only the
+/// server's word names its sender, so a sender key taken from one would pass
+/// the server's forgeries as that sender's group messages, or evict the
+/// sender's own key. The decryption error alone is passed on.
+#[tokio::test]
+async fn a_plaintext_with_a_side_car_is_dropped_and_its_sender_key_not_stored()
+{
+    let distribution_id = Uuid::from_u128(7);
+    let with_sender_key = proto::Content {
+        sender_key_distribution_message: Some(
+            alice_sender_key(distribution_id).await,
+        ),
+        ..decryption_error()
+    };
+    let with_pni_signature = proto::Content {
+        pni_signature_message: Some(proto::PniSignatureMessage {
+            pni: Some(vec![0x5a; 3]),
+            signature: Some(vec![0x33; 64]),
+        }),
+        ..decryption_error()
+    };
+    for (content, passed_on) in [
+        (decryption_error(), true),
+        (with_sender_key, false),
+        (with_pni_signature, false),
+    ] {
+        for (mut bob, envelope) in [
+            unsealed_plaintext(&content).await,
+            sealed_plaintext(&content).await,
+        ] {
+            let opened = bob
+                .open_envelope(&envelope, &mut rand::rng())
+                .await
+                .unwrap();
+            assert_eq!(opened.is_some(), passed_on, "{content:?}");
+            let stored = bob
+                .protocol_store
+                .load_sender_key(&address(1), distribution_id)
+                .await
+                .unwrap();
+            assert!(stored.is_none());
+        }
+    }
 }
 
 /// An unsealed envelope (PreKey, whisper or plaintext) without a source to
