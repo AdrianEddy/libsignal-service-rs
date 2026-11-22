@@ -52,7 +52,7 @@ pub mod prelude {
     pub use crate::{
         cipher::ServiceCipher,
         configuration::{ServiceConfiguration, ServiceCredentials},
-        content::Content,
+        content::{Content, DecryptedEnvelope},
         envelope::Envelope,
         groups_v2::{
             AccessControl, Group, Member, PendingMember, RequestingMember,

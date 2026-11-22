@@ -4,20 +4,22 @@ use std::{
 };
 
 use async_trait::async_trait;
+use base64::prelude::*;
 use futures::future::{self, FutureExt as _, LocalBoxFuture};
 use libsignal_protocol::{
-    kem, process_prekey_bundle, sealed_sender_encrypt, Aci, DeviceId,
-    GenericSignedPreKey as _, IdentityKeyPair, InMemSignalProtocolStore,
-    KeyPair, KyberPreKeyRecord, KyberPreKeyStore as _, PreKeyBundle,
-    ProtocolAddress, SenderCertificate, ServerCertificate, ServiceId,
-    SignalProtocolError, SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp,
+    create_sender_key_distribution_message, kem, process_prekey_bundle,
+    sealed_sender_encrypt, Aci, DeviceId, GenericSignedPreKey as _,
+    IdentityKeyPair, InMemSignalProtocolStore, KeyPair, KyberPreKeyRecord,
+    KyberPreKeyStore as _, PreKeyBundle, ProtocolAddress, SenderCertificate,
+    SenderKeyStore as _, ServerCertificate, ServiceId, SignalProtocolError,
+    SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp,
 };
 use prost::Message as _;
 use uuid::Uuid;
 
 use super::{add_padding, ServiceCipher};
 use crate::{
-    content::ContentBody,
+    content::{ContentBody, DecryptedEnvelope},
     envelope::Envelope,
     proto::{self, envelope::Type},
     push_service::ServiceError,
@@ -214,6 +216,215 @@ async fn device_with_bundle(
     (store, bundle)
 }
 
+/// A length-delimited protobuf field: its key, its length and `payload`.
+fn field(tag: u32, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for mut value in [(u64::from(tag) << 3) | 2, payload.len() as u64] {
+        while value >= 0x80 {
+            bytes.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        bytes.push(value as u8);
+    }
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+/// A PNI signature side-car whose PNI doesn't read, which the decrypt
+/// ignores.
+fn unverifiable_pni_signature() -> Vec<u8> {
+    proto::Content {
+        pni_signature_message: Some(proto::PniSignatureMessage {
+            pni: Some(vec![0x5a; 3]),
+            signature: Some(vec![0x33; 64]),
+        }),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
+/// Alice's first message to Bob, unsealed, of `plaintext` (a serialized
+/// `Content`), as Bob opens it.
+async fn bob_opens(
+    plaintext: &[u8],
+) -> Result<Option<DecryptedEnvelope>, ServiceError> {
+    let (mut bob, envelope) = alice_to_bob(plaintext).await;
+    bob.open_envelope(&envelope, &mut rand::rng()).await
+}
+
+/// Bob's cipher, and Alice's first message to him, unsealed, of `plaintext`
+/// (a serialized `Content`).
+async fn alice_to_bob(
+    plaintext: &[u8],
+) -> (ServiceCipher<InMemSignalProtocolStore>, Envelope) {
+    let rng = &mut rand::rng();
+    let (alice, bob) = (address(1), address(2));
+    let (bob_store, bob_bundle) = device_with_bundle(&bob).await;
+    let mut alice_store =
+        InMemSignalProtocolStore::new(IdentityKeyPair::generate(rng), 1)
+            .unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    process_prekey_bundle(
+        &bob,
+        &alice,
+        &mut alice_store.session_store,
+        &mut alice_store.identity_store,
+        &bob_bundle,
+        now,
+        rng,
+    )
+    .await
+    .unwrap();
+    let clock = Rc::new(FixedClock(now));
+    let sent =
+        ServiceCipher::new(alice_store, vec![], alice.clone(), clock.clone())
+            .encrypt(&bob, None, plaintext, rng)
+            .await
+            .unwrap();
+    let envelope = Envelope {
+        r#type: Some(sent.r#type as i32),
+        source_service_id: Some(alice.name().to_owned()),
+        source_device_id: Some(1),
+        destination_service_id: Some(bob.name().to_owned()),
+        client_timestamp: Some(1_700_000_000_000),
+        server_timestamp: Some(1_700_000_000_001),
+        content: Some(BASE64_STANDARD.decode(&sent.content).unwrap().into()),
+        ..Default::default()
+    };
+    (ServiceCipher::new(bob_store, vec![], bob, clock), envelope)
+}
+
+/// A sender key distribution message of Alice's, for `distribution_id`.
+async fn alice_sender_key(distribution_id: Uuid) -> Vec<u8> {
+    let rng = &mut rand::rng();
+    let mut store =
+        InMemSignalProtocolStore::new(IdentityKeyPair::generate(rng), 1)
+            .unwrap();
+    create_sender_key_distribution_message(
+        &address(1),
+        distribution_id,
+        &mut store,
+        rng,
+    )
+    .await
+    .unwrap()
+    .serialized()
+    .to_vec()
+}
+
+/// The plaintext comes back as its sender serialized it, beside the content
+/// decoded from it: with the fields this crate's protos don't know, a newer
+/// one in the `DataMessage` and a newer kind of content, and with the
+/// side-cars.
+#[tokio::test]
+async fn open_envelope_keeps_the_senders_bytes() {
+    let text = proto::Content {
+        content: Some(proto::content::Content::DataMessage(
+            proto::DataMessage {
+                body: Some("kept".into()),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    };
+    let sent = [
+        text.encode_to_vec(),
+        field(1, &field(1000, b"a newer field")),
+        field(100, b"a newer kind"),
+        unverifiable_pni_signature(),
+    ]
+    .concat();
+
+    let opened = bob_opens(&sent).await.unwrap().expect("opened");
+    assert_eq!(opened.plaintext, sent);
+    match opened.body {
+        Some(ContentBody::DataMessage(message)) => {
+            assert_eq!(message.body.as_deref(), Some("kept"))
+        },
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        opened.metadata.sender.service_id_string(),
+        address(1).name()
+    );
+    assert_eq!(opened.metadata.pni_verified, None);
+}
+
+/// A plaintext that holds no content of a kind this crate knows comes back
+/// whole, without a body, where it was dropped: a kind newer than its protos,
+/// a side-car alone, nothing at all.
+#[tokio::test]
+async fn open_envelope_passes_on_content_of_no_kind_it_knows() {
+    for sent in [
+        field(100, b"a newer kind"),
+        unverifiable_pni_signature(),
+        Vec::new(),
+    ] {
+        let opened = bob_opens(&sent).await.unwrap().expect("opened");
+        assert_eq!(opened.plaintext, sent);
+        assert!(opened.body.is_none(), "{:?}", opened.body);
+        assert_eq!(
+            opened.metadata.sender.service_id_string(),
+            address(1).name()
+        );
+    }
+}
+
+/// A sender key distribution beside a message is applied, and one that
+/// doesn't parse costs only itself, as Signal-Desktop has it: the message
+/// beside it is passed on, where the envelope failed after the decrypt had
+/// moved the session on, and the message was lost.
+#[tokio::test]
+async fn a_sender_key_distribution_that_doesnt_parse_costs_only_itself() {
+    let distribution_id = Uuid::from_u128(7);
+    let text = proto::Content {
+        content: Some(proto::content::Content::DataMessage(
+            proto::DataMessage {
+                body: Some("beside it".into()),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    for (skdm, applied) in [
+        (alice_sender_key(distribution_id).await, true),
+        (vec![0x5a; 3], false),
+    ] {
+        let sent = [text.clone(), field(7, &skdm)].concat();
+        let (mut bob, envelope) = alice_to_bob(&sent).await;
+        let opened = bob
+            .open_envelope(&envelope, &mut rand::rng())
+            .await
+            .unwrap()
+            .expect("opened");
+        match opened.body {
+            Some(ContentBody::DataMessage(message)) => {
+                assert_eq!(message.body.as_deref(), Some("beside it"))
+            },
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(opened.plaintext, sent);
+        let stored = bob
+            .protocol_store
+            .load_sender_key(&address(1), distribution_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.is_some(), applied);
+    }
+}
+
+/// A decryption error that doesn't decode is dropped, as both official
+/// clients drop it, where it failed the envelope, which then read as one
+/// that didn't decrypt.
+#[tokio::test]
+async fn a_decryption_error_that_doesnt_decode_is_dropped() {
+    // A ratchet key cut short.
+    let sent = field(8, &[0x0a, 0x05]);
+    let opened = bob_opens(&sent).await;
+    assert!(matches!(opened, Ok(None)), "{opened:?}");
+}
+
 /// A sender certificate is checked at the time the server took the message,
 /// as Desktop and Android check it, not at the time its sender claims: a
 /// sender with a fast clock keeps its messages, and a back-dated message
@@ -299,7 +510,7 @@ async fn sealed_sender_certificate_is_checked_at_the_server_timestamp() {
             bob.clone(),
             Rc::new(FixedClock(now)),
         );
-        async move { cipher.open_envelope(envelope, &mut rand::rng()).await }
+        async move { cipher.open_envelope(&envelope, &mut rand::rng()).await }
     };
     let hour = 60 * 60 * 1000;
 
@@ -307,7 +518,7 @@ async fn sealed_sender_certificate_is_checked_at_the_server_timestamp() {
     // hour before the certificate expired.
     let opened = open(expires + 24 * hour, expires - hour).await;
     let body = match opened.unwrap().expect("content").body {
-        ContentBody::DataMessage(message) => message.body,
+        Some(ContentBody::DataMessage(message)) => message.body,
         other => panic!("{other:?}"),
     };
     assert_eq!(body.as_deref(), Some("sealed"));

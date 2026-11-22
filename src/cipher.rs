@@ -2,6 +2,7 @@ use std::{convert::TryFrom, fmt, rc::Rc};
 
 use aes::cipher::block_padding::{Iso7816, Padding};
 use base64::prelude::*;
+use bytes::Bytes;
 use libsignal_core::ServiceIdKind;
 use libsignal_protocol::{
     group_decrypt, message_decrypt_prekey, message_decrypt_signal,
@@ -19,7 +20,7 @@ use rand::{CryptoRng, Rng};
 use uuid::Uuid;
 
 use crate::{
-    content::{Content, Metadata},
+    content::{ContentBody, DecryptedEnvelope, Metadata},
     envelope::Envelope,
     proto::PniSignatureMessage,
     push_service::{ServiceError, DEFAULT_DEVICE_ID},
@@ -102,109 +103,148 @@ where
         }
     }
 
-    /// Opens ("decrypts") an envelope.
+    /// Opens ("decrypts") an envelope: its sender, the plaintext and the
+    /// content decoded from it.
     ///
-    /// Envelopes may be empty, in which case this method returns `Ok(None)`
+    /// `Ok(None)` for an envelope without content, and for content that isn't
+    /// passed on: a plaintext envelope that isn't a decryption error, a
+    /// decryption error that doesn't decode, or a sync message that doesn't
+    /// come from our own ACI.
     ///
-    /// # PNI signature side-cars
+    /// The plaintext is the `Content` as its sender serialized it, unpadded,
+    /// side-cars and the fields this crate's protos don't know included, so a
+    /// caller that keeps it loses nothing. Its `body` is `None` when it holds
+    /// no content of a kind this crate knows: side-cars alone, or a kind newer
+    /// than its protos.
     ///
-    /// A side-car is verified during decryption and, when valid, its
-    /// PNI is exposed as `Metadata::pni_verified`. A side-car on a message with
-    /// no `content` is discarded, with a `tracing::warn!`; upstream Signal
-    /// clients only ever attach a side-car alongside `content`, so this path is
-    /// unreachable in practice, and wiring it through would change this method's
-    /// return type.
+    /// # Side-cars
+    ///
+    /// A sender key distribution is applied to the store before the content
+    /// is passed on. One that doesn't parse is skipped with a warning, and
+    /// the content beside it is still passed on.
+    ///
+    /// A PNI signature is verified during decryption and, when valid, its
+    /// PNI is exposed as `Metadata::pni_verified`, on a message without a
+    /// `body` too.
     ///
     /// **NOTE**: must process `Metadata::pni_verified` to confirm the sender's
     /// PNI, not the raw side-car message.
-    #[tracing::instrument(skip(envelope, csprng), fields(envelope = debug_envelope(&envelope)))]
+    #[tracing::instrument(
+        skip(envelope, csprng),
+        fields(envelope = debug_envelope(envelope), envelope_metadata)
+    )]
     pub async fn open_envelope<R: Rng + CryptoRng>(
         &mut self,
-        envelope: Envelope,
+        envelope: &Envelope,
         csprng: &mut R,
-    ) -> Result<Option<Content>, ServiceError> {
+    ) -> Result<Option<DecryptedEnvelope>, ServiceError> {
+        if envelope.content.is_none() {
+            return Ok(None);
+        }
         let local_service: ServiceId =
             ServiceId::parse_from_service_id_string(self.local_address.name())
                 .expect("valid protocol address name");
 
-        if envelope.content.is_some() {
-            let plaintext = self.decrypt(&envelope, csprng).await?;
-            let was_plaintext = plaintext.metadata.was_plaintext;
+        let Plaintext {
+            metadata,
+            message,
+            bytes: plaintext,
+        } = self.decrypt(envelope, csprng).await?;
 
-            tracing::Span::current()
-                .record("envelope_metadata", plaintext.metadata.to_string());
+        tracing::Span::current()
+            .record("envelope_metadata", tracing::field::display(&metadata));
 
-            // Ingest side-car messages *before* processing content (which possibly triggers an early `return Ok(None)`)
+        // Ingest side-car messages *before* processing content (which possibly triggers an early `return Ok(None)`)
 
-            if let Some(bytes) =
-                &plaintext.message.sender_key_distribution_message
-            {
-                let skdm = SenderKeyDistributionMessage::try_from(&bytes[..])?;
-                let sender = plaintext.metadata.protocol_address()?;
-                process_sender_key_distribution_message(
-                    &sender,
-                    &skdm,
-                    &mut self.protocol_store,
-                )
-                .await?;
-                tracing::info!(
-                    distribution_id = %skdm.distribution_id()?,
-                    sender = %sender,
-                    "applied sender key distribution message"
+        // A sender key distribution that doesn't parse costs only itself, as
+        // Signal-Desktop has it, not the content the decrypt has already
+        // moved the session on for. Once it parsed, applying it fails only in
+        // the store, and that fails the envelope.
+        let skdm = message
+            .sender_key_distribution_message
+            .as_deref()
+            .and_then(|bytes| {
+                SenderKeyDistributionMessage::try_from(bytes)
+                    .inspect_err(|error| {
+                        tracing::warn!(
+                            %error,
+                            "ignoring a sender key distribution message that doesn't parse"
+                        )
+                    })
+                    .ok()
+            });
+        if let Some(skdm) = skdm {
+            let sender = metadata.protocol_address()?;
+            process_sender_key_distribution_message(
+                &sender,
+                &skdm,
+                &mut self.protocol_store,
+            )
+            .await?;
+            tracing::info!(
+                distribution_id = %skdm.distribution_id()?,
+                sender = %sender,
+                "applied sender key distribution message"
+            );
+        }
+
+        // Now, process actual content, *after* side-car messages such as SKDM or PNI
+        // signatures.
+
+        // Sanity test: if the envelope was plaintext, the message should *only* be a
+        // decryption failure error
+        if metadata.was_plaintext {
+            let Some(crate::proto::content::Content::DecryptionErrorMessage(
+                dme,
+            )) = &message.content
+            else {
+                tracing::error!(
+                    ?envelope,
+                    "Received a plaintext envelope with a non-decryption error message."
                 );
-            }
-
-            let Some(content) = &plaintext.message.content else {
-                // Cheap-out: post-decrypt side-ops are not propagated alongside the
-                // Option<Content>, so a content-less message drops its sidecar here.
-                // TODO: return a Vec<DecryptPostOp> next to the Option<Content>.
-                if let Some(pni) = plaintext.metadata.pni_verified {
-                    tracing::warn!(
-                        ?pni,
-                        "dropped verified PNI signature: content-less message"
-                    );
-                }
-                tracing::warn!("empty decrypted content");
                 return Ok(None);
             };
-
-            // Now, process actual content, *after* side-car messages such as SKDM or PNI
-            // signatures.
-
-            // Sanity test: if the envelope was plaintext, the message should *only* be a
-            // decryption failure error
-            if was_plaintext {
-                let crate::proto::content::Content::DecryptionErrorMessage(dme) =
-                    content
-                else {
-                    tracing::error!(
-                        ?envelope,
-                        "Received a plaintext envelope with a non-decryption error message."
-                    );
-                    return Ok(None);
-                };
-                tracing::warn!(
-                    ?envelope,
-                    len = dme.len(),
-                    "Received a decryption error message."
-                );
-            }
-
-            // Filter out SyncMessages that don't come from our own ACI.
-            if matches!(content, crate::proto::content::Content::SyncMessage(_))
-                && (plaintext.metadata.sender.aci() != local_service.aci()
-                    || local_service.kind() == ServiceIdKind::Pni)
-            {
-                tracing::warn!("Source is not ourself.");
-                return Ok(None);
-            }
-
-            let content =
-                Content::from_proto(plaintext.message, plaintext.metadata);
-            Ok(Some(content?))
-        } else {
-            Ok(None)
+            tracing::warn!(
+                ?envelope,
+                len = dme.len(),
+                "Received a decryption error message."
+            );
         }
+
+        // Filter out SyncMessages that don't come from our own ACI.
+        if matches!(
+            message.content,
+            Some(crate::proto::content::Content::SyncMessage(_))
+        ) && (metadata.sender.aci() != local_service.aci()
+            || local_service.kind() == ServiceIdKind::Pni)
+        {
+            tracing::warn!("Source is not ourself.");
+            return Ok(None);
+        }
+
+        // A decryption error is the one kind whose body is decoded here, so
+        // the only one that can fail: it is dropped, as both official clients
+        // drop it, where failing the envelope would read as one that didn't
+        // decrypt.
+        let body = match message.content.map(ContentBody::try_from).transpose()
+        {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "dropping a decryption error message that doesn't decode"
+                );
+                return Ok(None);
+            },
+        };
+        if body.is_none() {
+            tracing::debug!("decrypted content of no kind this crate knows");
+        }
+        Ok(Some(DecryptedEnvelope {
+            metadata,
+            body,
+            plaintext,
+        }))
     }
 
     /// Verify a `PniSignatureMessage` sidecar against the sender's stored identity keys.
@@ -558,7 +598,11 @@ where
             server_guid,
             pni_verified,
         };
-        Ok(Plaintext { metadata, message })
+        Ok(Plaintext {
+            metadata,
+            message,
+            bytes: Bytes::from(parts.data),
+        })
     }
 
     /// Encrypts `content` (a serialized `Content`, which this pads) for one
@@ -659,6 +703,8 @@ where
 struct Plaintext {
     metadata: Metadata,
     message: crate::proto::Content,
+    /// The unpadded plaintext `message` was decoded from.
+    bytes: Bytes,
 }
 
 #[expect(clippy::comparison_chain)]

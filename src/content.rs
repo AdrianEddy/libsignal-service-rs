@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use chrono::Utc;
 use libsignal_core::DeviceId;
 use libsignal_protocol::{Pni, ProtocolAddress, ServiceId};
@@ -70,6 +71,20 @@ pub struct Content {
     pub body: ContentBody,
 }
 
+/// An envelope [`ServiceCipher::open_envelope`](crate::cipher::ServiceCipher::open_envelope)
+/// decrypted.
+#[derive(Clone, derive_more::Debug)]
+pub struct DecryptedEnvelope {
+    pub metadata: Metadata,
+    /// The content `plaintext` holds; `None` when it holds none of a kind
+    /// this crate knows: side-cars alone, or a kind newer than its protos.
+    pub body: Option<ContentBody>,
+    /// The `Content` as its sender serialized it, unpadded: its side-cars and
+    /// the fields this crate's protos don't know included.
+    #[debug("{} bytes", plaintext.len())]
+    pub plaintext: Bytes,
+}
+
 impl Content {
     pub fn from_body(body: impl Into<ContentBody>, metadata: Metadata) -> Self {
         Self {
@@ -83,27 +98,38 @@ impl Content {
         p: crate::proto::Content,
         metadata: Metadata,
     ) -> Result<Self, ServiceError> {
-        let Some(content) = p.content else {
-            return Err(ServiceError::UnsupportedContent);
-        };
+        let content = p.content.ok_or(ServiceError::UnsupportedContent)?;
+        Ok(Self {
+            metadata,
+            body: content.try_into()?,
+        })
+    }
+}
 
+impl TryFrom<crate::proto::content::Content> for ContentBody {
+    type Error = prost::DecodeError;
+
+    /// A decryption error is the one kind whose body is decoded here, so the
+    /// only one that can fail.
+    fn try_from(
+        content: crate::proto::content::Content,
+    ) -> Result<Self, Self::Error> {
         use crate::proto::content::Content;
-        match content {
-            Content::DataMessage(msg) => Ok(Self::from_body(msg, metadata)),
-            Content::SyncMessage(msg) => Ok(Self::from_body(msg, metadata)),
-            Content::CallMessage(msg) => Ok(Self::from_body(msg, metadata)),
-            Content::NullMessage(msg) => Ok(Self::from_body(msg, metadata)),
-            Content::ReceiptMessage(msg) => Ok(Self::from_body(msg, metadata)),
-            Content::TypingMessage(msg) => Ok(Self::from_body(msg, metadata)),
-            Content::DecryptionErrorMessage(msg) => Ok(Self {
-                metadata,
-                body: ContentBody::DecryptionErrorMessage(
-                    DecryptionErrorMessage::decode(msg.as_ref())?,
-                ),
-            }),
-            Content::StoryMessage(msg) => Ok(Self::from_body(msg, metadata)),
-            Content::EditMessage(msg) => Ok(Self::from_body(msg, metadata)),
-        }
+        Ok(match content {
+            Content::DataMessage(msg) => Self::DataMessage(msg),
+            Content::SyncMessage(msg) => Self::SynchronizeMessage(msg),
+            Content::CallMessage(msg) => Self::CallMessage(msg),
+            Content::NullMessage(msg) => Self::NullMessage(msg),
+            Content::ReceiptMessage(msg) => Self::ReceiptMessage(msg),
+            Content::TypingMessage(msg) => Self::TypingMessage(msg),
+            Content::DecryptionErrorMessage(msg) => {
+                Self::DecryptionErrorMessage(DecryptionErrorMessage::decode(
+                    msg.as_ref(),
+                )?)
+            },
+            Content::StoryMessage(msg) => Self::StoryMessage(msg),
+            Content::EditMessage(msg) => Self::EditMessage(msg),
+        })
     }
 }
 

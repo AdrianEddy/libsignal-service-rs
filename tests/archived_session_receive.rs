@@ -22,7 +22,7 @@ use libsignal_protocol::{
 };
 use libsignal_service::{
     cipher::ServiceCipher,
-    content::{Content, ContentBody},
+    content::{ContentBody, DecryptedEnvelope},
     envelope::Envelope,
     proto::{self, envelope::Type},
     push_service::ServiceError,
@@ -141,14 +141,14 @@ impl Peer {
     async fn open(
         &self,
         envelope: Envelope,
-    ) -> Result<Option<Content>, ServiceError> {
+    ) -> Result<Option<DecryptedEnvelope>, ServiceError> {
         ServiceCipher::new(
             self.store.clone(),
             vec![],
             self.address.clone(),
             Rc::new(SystemClock),
         )
-        .open_envelope(envelope, &mut rng())
+        .open_envelope(&envelope, &mut rng())
         .await
     }
 
@@ -192,9 +192,11 @@ impl Peer {
     }
 }
 
-fn text_of(opened: Result<Option<Content>, ServiceError>) -> String {
+fn text_of(opened: Result<Option<DecryptedEnvelope>, ServiceError>) -> String {
     match opened.expect("decrypted").expect("some content").body {
-        ContentBody::DataMessage(message) => message.body.expect("a body"),
+        Some(ContentBody::DataMessage(message)) => {
+            message.body.expect("a body")
+        },
         other => panic!("unexpected content {other:?}"),
     }
 }

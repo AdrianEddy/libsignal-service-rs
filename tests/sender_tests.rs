@@ -239,11 +239,11 @@ fn sent_transcript_free_fn_equals_method_output() {
                 our_aci.to_protocol_address(device(1)).unwrap(),
                 clock,
             )
-            .open_envelope(envelope, rng),
+            .open_envelope(&envelope, rng),
         )
         .unwrap()
         .expect("content");
-    let ContentBody::SynchronizeMessage(on_the_wire) = opened.body else {
+    let Some(ContentBody::SynchronizeMessage(on_the_wire)) = opened.body else {
         panic!("{:?}", opened.body)
     };
 
@@ -434,7 +434,7 @@ fn pni_signature_free_fn_verifies() {
     };
     let opened = block_on(
         ServiceCipher::new(bob_store, vec![], bob, clock)
-            .open_envelope(envelope, rng),
+            .open_envelope(&envelope, rng),
     )
     .unwrap()
     .expect("content");
