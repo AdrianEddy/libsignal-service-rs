@@ -158,6 +158,27 @@ async fn clock_drives_session_staleness() {
     );
 }
 
+/// A content pads as Signal-Android's `PushTransportDetails` and
+/// Signal-Desktop's `padMessage` pad it: a 0x80 terminator, then zeros to one
+/// byte short of a multiple of 80, so a message's length on the wire is the
+/// official clients' and the cipher adds a single byte of its own.
+#[test]
+fn contents_pad_as_the_official_clients_pad() {
+    for (lengths, padded) in [(0..=78, 79), (79..=158, 159), (159..=238, 239)] {
+        for length in lengths {
+            let content = vec![0x2a; length];
+            let buffer = add_padding(4, &content).unwrap();
+            assert_eq!(buffer.len(), padded, "{length}");
+            assert_eq!(buffer[..length], content[..]);
+            assert_eq!(buffer[length], 0x80);
+            assert!(buffer[length + 1..].iter().all(|&byte| byte == 0));
+            let mut stripped = buffer;
+            super::strip_padding(&mut stripped).unwrap();
+            assert_eq!(stripped, content);
+        }
+    }
+}
+
 /// A device that keeps the prekeys its bundle offers, so it can open what is
 /// sent to it.
 async fn device_with_bundle(

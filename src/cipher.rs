@@ -707,6 +707,13 @@ struct Plaintext {
     bytes: Bytes,
 }
 
+/// The official clients' padding block (Signal-Android's
+/// `PushTransportDetails`, Signal-Desktop's `padMessage`).
+const PADDING_BLOCK_SIZE: usize = 80;
+
+/// Pads `contents` as the official clients do: a 0x80 terminator, then zeros
+/// to one byte short of a whole number of blocks, so the cipher's own padding
+/// adds a single byte rather than a block.
 #[expect(clippy::comparison_chain)]
 fn add_padding(version: u32, contents: &[u8]) -> Result<Vec<u8>, ServiceError> {
     if version < 2 {
@@ -715,15 +722,11 @@ fn add_padding(version: u32, contents: &[u8]) -> Result<Vec<u8>, ServiceError> {
         Ok(contents.to_vec())
     } else {
         let message_length = contents.len();
-        let message_length_with_terminator = contents.len() + 1;
-        let mut message_part_count = message_length_with_terminator / 160;
-        if !message_length_with_terminator.is_multiple_of(160) {
-            message_part_count += 1;
-        }
+        let padded_length = (message_length + 2).div_ceil(PADDING_BLOCK_SIZE)
+            * PADDING_BLOCK_SIZE
+            - 1;
 
-        let message_length_with_padding = message_part_count * 160;
-
-        let mut buffer = vec![0u8; message_length_with_padding];
+        let mut buffer = vec![0u8; padded_length];
         buffer[..message_length].copy_from_slice(contents);
         Iso7816::raw_pad(&mut buffer, message_length);
         Ok(buffer)
