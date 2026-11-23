@@ -35,7 +35,8 @@ type StoreResult<T> = Result<T, SignalProtocolError>;
 /// The upload names its fields as Signal-Server's `SetKeysRequest` does
 /// (`preKeys`, `signedPreKey`, `pqPreKeys`, `pqLastResortPreKey`; it ignores
 /// `identityKey`), and it ignores a field it doesn't know: under another name
-/// the last-resort key answered 204 and changed nothing.
+/// the last-resort key answered 204 and changed nothing. A key left out keeps
+/// the server's: no signed prekey goes when its rotation isn't due.
 #[test]
 fn the_upload_names_its_keys_as_signal_server_reads_them() {
     let mut pool = LocalPool::new();
@@ -58,20 +59,22 @@ fn the_upload_names_its_keys_as_signal_server_reads_them() {
         public_key: public_key.clone(),
         signature: signature.clone(),
     };
-    let state = |pq_last_resort_key| PreKeyState {
+    let signed = || SignedPreKeyEntity {
+        key_id: 3,
+        public_key: vec![0x05; 33],
+        signature: vec![0x0a; 64],
+    };
+    let state = |signed_pre_key, pq_last_resort_key| PreKeyState {
         pre_keys: Vec::new(),
-        signed_pre_key: SignedPreKeyEntity {
-            key_id: 3,
-            public_key: vec![0x05; 33],
-            signature: vec![0x0a; 64],
-        },
+        signed_pre_key,
         identity_key: *identity.identity_key(),
         pq_last_resort_key,
         pq_pre_keys: Vec::new(),
     };
 
-    for (pq_last_resort_key, names) in [
+    for (signed_pre_key, pq_last_resort_key, names) in [
         (
+            Some(signed()),
             Some(last_resort()),
             vec![
                 "identityKey",
@@ -82,12 +85,17 @@ fn the_upload_names_its_keys_as_signal_server_reads_them() {
             ],
         ),
         (
+            Some(signed()),
             None,
             vec!["identityKey", "pqPreKeys", "preKeys", "signedPreKey"],
         ),
+        (None, None, vec!["identityKey", "pqPreKeys", "preKeys"]),
     ] {
         let (uploaded, request) = pool.run_until(future::join(
-            ws.register_pre_keys(ServiceIdKind::Aci, state(pq_last_resort_key)),
+            ws.register_pre_keys(
+                ServiceIdKind::Aci,
+                state(signed_pre_key, pq_last_resort_key),
+            ),
             async {
                 let request = sent_request(server.next_sent().await);
                 server.respond(request.id(), 204, b"");

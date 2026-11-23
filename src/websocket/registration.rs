@@ -471,6 +471,7 @@ impl SignalWebSocket<websocket::Unidentified> {
             clock,
             &aci_identity_key_pair,
             true,
+            true,
             0,
             0,
         )
@@ -487,6 +488,7 @@ impl SignalWebSocket<websocket::Unidentified> {
             clock,
             &pni_identity_key_pair,
             true,
+            true,
             0,
             0,
         )
@@ -497,11 +499,12 @@ impl SignalWebSocket<websocket::Unidentified> {
         let keys = RegistrationKeyPackage {
             aci_identity_key: aci_identity_key.serialize().into(),
             pni_identity_key: pni_identity_key.serialize().into(),
-            aci_signed_pre_key: SignedPreKeyEntity::try_from(
-                &aci_signed_pre_key,
-            )
-            .unwrap(),
-            pni_signed_pre_key: pni_signed_pre_key.try_into()?,
+            aci_signed_pre_key: aci_signed_pre_key
+                .expect("requested signed prekey")
+                .try_into()?,
+            pni_signed_pre_key: pni_signed_pre_key
+                .expect("requested signed prekey")
+                .try_into()?,
             aci_pq_last_resort_pre_key: aci_last_resort_kyber_prekey
                 .expect("requested last resort prekey")
                 .try_into()?,

@@ -1,18 +1,22 @@
-//! The ids `replenish_pre_keys` gives a batch, which go round a cycle of
-//! 1 to 0xFFFFFE.
+//! What `replenish_pre_keys` makes: the ids it gives a batch, which go round a
+//! cycle of 1 to 0xFFFFFE, and a batch without a signed prekey.
 
 mod common;
 
-use std::time::SystemTime;
+use std::{cell::Cell, time::SystemTime};
 
 use async_trait::async_trait;
 use futures::FutureExt as _;
 use libsignal_service::{
-    pre_keys::{replenish_pre_keys, KyberPreKeyStoreExt, PreKeysStore},
+    pre_keys::{
+        replenish_pre_keys, KyberPreKeyStoreExt, PreKeyState, PreKeysStore,
+        SignedPreKeyEntity,
+    },
     protocol::{
         GenericSignedPreKey as _, IdentityKeyPair, IdentityKeyStore as _,
         KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore as _,
         PreKeyStore as _, SignalProtocolError, SignedPreKeyId,
+        SignedPreKeyStore as _,
     },
 };
 
@@ -39,6 +43,7 @@ fn a_batch_goes_round_the_cycle_of_ids() {
             &ManualClock::default(),
             &identity,
             true,
+            true,
             count,
             count,
         )
@@ -64,11 +69,67 @@ fn a_batch_goes_round_the_cycle_of_ids() {
     }
 }
 
+/// A refill makes a signed prekey only when asked for one, as the official
+/// clients do: without it none is generated or saved, the store is asked no id
+/// for one, and the upload leaves `signedPreKey` out, which keeps the server's.
+#[test]
+fn a_batch_without_a_signed_prekey_saves_and_uploads_none() {
+    for rotate in [false, true] {
+        let rng = &mut rand::rng();
+        let identity = IdentityKeyPair::generate(rng);
+        let mut store = LocalStore::new(identity, 7);
+        let (pre_keys, signed, kyber, last_resort) = replenish_pre_keys(
+            &mut store,
+            rng,
+            &ManualClock::default(),
+            &identity,
+            rotate,
+            false,
+            2,
+            2,
+        )
+        .now_or_never()
+        .expect("the store doesn't wait")
+        .unwrap();
+        assert_eq!((pre_keys.len(), kyber.len()), (2, 2));
+        assert!(last_resort.is_none());
+
+        assert_eq!(signed.is_some(), rotate);
+        assert_eq!(SIGNED_IDS_ASKED.take(), u32::from(rotate));
+        let saved = store
+            .get_signed_pre_key(SIGNED_ID.into())
+            .now_or_never()
+            .expect("the store doesn't wait");
+        assert_eq!(saved.is_ok(), rotate, "{:?}", saved.err());
+
+        let upload = PreKeyState {
+            pre_keys: Vec::new(),
+            signed_pre_key: signed
+                .map(SignedPreKeyEntity::try_from)
+                .transpose()
+                .unwrap(),
+            identity_key: *identity.identity_key(),
+            pq_last_resort_key: None,
+            pq_pre_keys: Vec::new(),
+        };
+        let upload = serde_json::to_value(&upload).unwrap();
+        assert_eq!(upload.get("signedPreKey").is_some(), rotate, "{upload}");
+    }
+}
+
 /// What the store answered at once.
 fn stored<T>(read: impl std::future::Future<Output = StoreResult<T>>) -> T {
     read.now_or_never()
         .expect("the store doesn't wait")
         .expect("stored")
+}
+
+/// The id the store gives the next signed prekey.
+const SIGNED_ID: u32 = 1;
+
+thread_local! {
+    /// How many times the store was asked for it, on this test's thread.
+    static SIGNED_IDS_ASKED: Cell<u32> = const { Cell::new(0) };
 }
 
 // A batch numbers its EC and Kyber keys from the store's registration id, so a
@@ -81,7 +142,8 @@ impl PreKeysStore for LocalStore {
     }
 
     async fn next_signed_pre_key_id(&self) -> StoreResult<u32> {
-        Ok(1)
+        SIGNED_IDS_ASKED.set(SIGNED_IDS_ASKED.get() + 1);
+        Ok(SIGNED_ID)
     }
 
     async fn next_pq_pre_key_id(&self) -> StoreResult<u32> {

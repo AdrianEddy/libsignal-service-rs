@@ -180,7 +180,10 @@ impl TryFrom<KyberPreKeyRecord> for KyberPreKeyEntity {
 #[serde(rename_all = "camelCase")]
 pub struct PreKeyState {
     pub pre_keys: Vec<PreKeyEntity>,
-    pub signed_pre_key: SignedPreKeyEntity,
+    /// Without one, Signal-Server keeps the signed prekey it holds
+    /// (`SetKeysRequest`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signed_pre_key: Option<SignedPreKeyEntity>,
     #[serde(with = "serde_identity_key")]
     pub identity_key: IdentityKey,
     /// Signal-Server's `SetKeysRequest` name, which it reads while it ignores
@@ -227,26 +230,30 @@ pub(crate) fn generate_kyber_pre_key<R: Rng + CryptoRng>(
 /// Generates and stores a batch of prekeys. Every signed and Kyber prekey of
 /// the batch carries the same creation time, read once from `clock`. Nothing
 /// is sent: the caller uploads what it returns once the store has it.
+///
+/// Without `rotate_signed_pre_key` no signed prekey is generated or saved, and
+/// the store is asked no id for one: the official clients refill one-time
+/// prekeys without replacing the signed one, which they rotate only when due.
+#[allow(clippy::too_many_arguments)]
 pub async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
     protocol_store: &mut P,
     csprng: &mut R,
     clock: &dyn Clock,
     identity_key_pair: &IdentityKeyPair,
+    rotate_signed_pre_key: bool,
     use_last_resort_key: bool,
     pre_key_count: u32,
     kyber_pre_key_count: u32,
 ) -> Result<
     (
         Vec<PreKeyRecord>,
-        SignedPreKeyRecord,
+        Option<SignedPreKeyRecord>,
         Vec<KyberPreKeyRecord>,
         Option<KyberPreKeyRecord>,
     ),
     SignalProtocolError,
 > {
     let pre_keys_offset_id = protocol_store.next_pre_key_id().await?;
-    let next_signed_pre_key_id =
-        protocol_store.next_signed_pre_key_id().await?;
     let pq_pre_keys_offset_id = protocol_store.next_pq_pre_key_id().await?;
     let now = Timestamp::from_epoch_millis(epoch_millis(clock));
 
@@ -286,25 +293,23 @@ pub async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
     }
 
     // Generate and store the next signed prekey
-    let signed_pre_key_pair = KeyPair::generate(csprng);
-    let signed_pre_key_public = signed_pre_key_pair.public_key;
-    let signed_pre_key_signature = identity_key_pair
-        .private_key()
-        .calculate_signature(&signed_pre_key_public.serialize(), csprng)?;
+    let signed_pre_key = if rotate_signed_pre_key {
+        let pre_key_id = protocol_store.next_signed_pre_key_id().await?.into();
 
-    let signed_prekey_record = SignedPreKeyRecord::new(
-        next_signed_pre_key_id.into(),
-        now,
-        &signed_pre_key_pair,
-        &signed_pre_key_signature,
-    );
+        let key_pair = KeyPair::generate(csprng);
+        let signature = identity_key_pair
+            .private_key()
+            .calculate_signature(&key_pair.public_key.serialize(), csprng)?;
+        let pre_key_record =
+            SignedPreKeyRecord::new(pre_key_id, now, &key_pair, &signature);
+        protocol_store
+                    .save_signed_pre_key(pre_key_id, &pre_key_record)
+                    .instrument(tracing::trace_span!(parent: &span, "save signed pre key", ?pre_key_id)).await?;
 
-    protocol_store
-                .save_signed_pre_key(
-                    next_signed_pre_key_id.into(),
-                    &signed_prekey_record,
-                )
-                    .instrument(tracing::trace_span!(parent: &span, "save signed pre key", signed_pre_key_id = ?next_signed_pre_key_id)).await?;
+        Some(pre_key_record)
+    } else {
+        None
+    };
 
     let pq_last_resort_key = if use_last_resort_key {
         // The id after the batch's last one-time Kyber key.
@@ -325,12 +330,7 @@ pub async fn replenish_pre_keys<R: Rng + CryptoRng, P: PreKeysStore>(
         None
     };
 
-    Ok((
-        pre_keys,
-        signed_prekey_record,
-        pq_pre_keys,
-        pq_last_resort_key,
-    ))
+    Ok((pre_keys, signed_pre_key, pq_pre_keys, pq_last_resort_key))
 }
 
 #[cfg(test)]

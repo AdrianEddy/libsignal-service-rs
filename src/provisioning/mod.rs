@@ -347,11 +347,14 @@ async fn link_steps<
             clock,
             &account.aci_key_pair,
             true,
+            true,
             0,
             0,
         )
         .await?;
 
+        let aci_signed_pre_key =
+            aci_signed_pre_key.expect("requested signed prekey");
         let aci_pq_last_resort_pre_key =
             aci_pq_last_resort_pre_key.expect("requested last resort key");
         assert!(_aci_pre_keys.is_empty());
@@ -373,11 +376,14 @@ async fn link_steps<
                     clock,
                     &identity.key_pair,
                     true,
+                    true,
                     0,
                     0,
                 )
                 .await?;
 
+                let signed_pre_key =
+                    signed_pre_key.expect("requested signed prekey");
                 let pq_last_resort_pre_key =
                     pq_last_resort_pre_key.expect("requested last resort key");
                 assert!(_pni_pre_keys.is_empty());

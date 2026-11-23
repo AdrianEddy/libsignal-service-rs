@@ -1023,6 +1023,7 @@ fn replenish_pre_keys_works_from_outside_the_crate() {
         &ManualClock::default(),
         &identity,
         true,
+        true,
         0,
         0,
     )
@@ -1031,6 +1032,7 @@ fn replenish_pre_keys_works_from_outside_the_crate() {
     .unwrap();
     assert!(pre_keys.is_empty());
     assert!(pq_pre_keys.is_empty());
+    let signed = signed.expect("requested");
     let last_resort = last_resort.expect("requested");
 
     let created = Timestamp::from_epoch_millis(1_700_000_000_000);

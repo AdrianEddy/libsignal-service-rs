@@ -250,6 +250,8 @@ impl AccountManager {
                 &mut rand::rng(),
                 &*self.clock,
                 &identity_key_pair,
+                // Rotated with every upload: nothing else here rotates it.
+                true,
                 use_last_resort_key && !has_last_resort_key,
                 PRE_KEY_BATCH_SIZE,
                 PRE_KEY_BATCH_SIZE,
@@ -283,7 +285,9 @@ impl AccountManager {
             .into_iter()
             .map(PreKeyEntity::try_from)
             .collect::<Result<_, _>>()?;
-        let signed_pre_key = signed_pre_key.try_into()?;
+        let signed_pre_key = signed_pre_key
+            .map(SignedPreKeyEntity::try_from)
+            .transpose()?;
         let pq_pre_keys: Vec<_> = pq_pre_keys
             .into_iter()
             .map(KyberPreKeyEntity::try_from)
@@ -785,6 +789,7 @@ impl AccountManager {
                     &*self.clock,
                     &pni_identity_key_pair,
                     true,
+                    true,
                     0,
                     0,
                 )
@@ -819,11 +824,13 @@ impl AccountManager {
                 )?;
                 (
                     vec![],
-                    signed_prekey_record,
+                    Some(signed_prekey_record),
                     vec![],
                     Some(kyber_pre_key_record),
                 )
             };
+            let signed_pre_key =
+                signed_pre_key.expect("requested signed prekey");
 
             let registration_id = if local_device_id == *DEFAULT_DEVICE_ID {
                 pni_protocol_store.get_local_registration_id().await?
