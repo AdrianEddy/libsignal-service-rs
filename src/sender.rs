@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use libsignal_core::{curve::CurveError, InvalidDeviceId};
 use libsignal_protocol::{
@@ -137,7 +137,12 @@ pub enum MessageSenderError {
     MaximumRetriesLimitExceeded,
 
     #[error("Proof of type {options:?} required using token {token}")]
-    ProofRequired { token: String, options: Vec<String> },
+    ProofRequired {
+        token: String,
+        options: Vec<String>,
+        /// See [`ProofRequired::retry_after`].
+        retry_after: Option<Duration>,
+    },
 
     #[error("Recipient not found: {service_id:?}")]
     NotFound { service_id: ServiceId },
@@ -842,6 +847,7 @@ where
                     return Err(MessageSenderError::ProofRequired {
                         token: p.token.clone(),
                         options: p.options.clone(),
+                        retry_after: p.retry_after,
                     });
                 },
                 Err(ServiceError::UnregisteredRecipient) => {

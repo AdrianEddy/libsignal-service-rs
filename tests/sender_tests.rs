@@ -23,8 +23,9 @@ use libsignal_service::{
     envelope::Envelope,
     prelude::ProtobufMessage,
     proto::{
-        self, envelope::Type, DataMessage, EditMessage, SyncMessage,
-        WebSocketRequestMessage,
+        self, envelope::Type, web_socket_message, DataMessage, EditMessage,
+        SyncMessage, WebSocketMessage, WebSocketRequestMessage,
+        WebSocketResponseMessage,
     },
     protocol::{
         process_prekey_bundle, Aci, DeviceId, IdentityKeyPair,
@@ -33,7 +34,10 @@ use libsignal_service::{
         SessionUsabilityRequirements, SignalProtocolError, Timestamp,
     },
     push_service::ServiceError,
-    sender::{pni_signature, sent_transcript, MessageSender, SentMessage},
+    sender::{
+        pni_signature, sent_transcript, MessageSender, MessageSenderError,
+        SentMessage,
+    },
     session_store::has_usable_session,
     transport::Clock as _,
     unidentified_access::UnidentifiedAccess,
@@ -750,5 +754,129 @@ fn unidentified_pre_keys_refused_key_is_unauthorized() {
             "{status}: {:?}",
             refused.err()
         );
+    }
+}
+
+/// A send the server challenges (428) tells its caller the wait that lifts the
+/// challenge on its own: the answer's `Retry-After`, or none when it names
+/// none.
+#[test]
+fn a_challenged_send_names_the_wait() {
+    for (headers, wait) in [
+        (
+            vec!["Retry-After: 42".to_owned()],
+            Some(Duration::from_secs(42)),
+        ),
+        (Vec::new(), None),
+    ] {
+        let mut pool = LocalPool::new();
+        let rng = &mut rand::rng();
+        let clock = Rc::new(ManualClock::default());
+        let (service, transport) = push_service();
+        let mut server = transport.accept_socket(&[]);
+        let _unidentified_server = transport.accept_socket(&[]);
+        let (identified, task) = pool
+            .run_until(service.ws::<Identified>(
+                "/v1/websocket/",
+                "/v1/keepalive",
+                &[],
+                Some(credentials()),
+                clock.clone(),
+            ))
+            .unwrap();
+        pool.spawner().spawn_local(task.map(drop)).unwrap();
+        let (unidentified, task) = pool
+            .run_until(service.ws::<Unidentified>(
+                "/v1/websocket/",
+                "/v1/keepalive",
+                &[],
+                None,
+                clock.clone(),
+            ))
+            .unwrap();
+        pool.spawner().spawn_local(task.map(drop)).unwrap();
+
+        // We are the account's only device, with a session with the peer's.
+        let our_aci = Aci::from(ACI);
+        let account = IdentityKeyPair::generate(rng);
+        let ours = SyncStore::new(account, 11);
+        let peer = ServiceId::from(Aci::from(Uuid::from_u128(0x5eed)));
+        let bundle = pool.run_until(
+            LocalStore::new(IdentityKeyPair::generate(rng), 33)
+                .bundle(device(1)),
+        );
+        pool.run_until(process_prekey_bundle(
+            &peer.to_protocol_address(device(1)).unwrap(),
+            &our_aci.to_protocol_address(device(1)).unwrap(),
+            &mut ours.clone(),
+            &mut ours.clone(),
+            &bundle,
+            clock.now(),
+            rng,
+        ))
+        .unwrap();
+        let cipher = ServiceCipher::new(
+            ours.clone(),
+            vec![],
+            our_aci.into(),
+            device(1),
+            clock,
+        );
+        let mut sender = MessageSender::new(
+            identified,
+            unidentified,
+            service,
+            cipher,
+            ours,
+            our_aci,
+            Pni::from(Uuid::from_u128(0x9e)),
+            account,
+            None,
+            device(1),
+        );
+        let message = DataMessage {
+            body: Some("hello".into()),
+            ..Default::default()
+        };
+        let (sent, request) = pool.run_until(future::join(
+            sender.send_message(&peer, None, message, 1, false, false),
+            async {
+                let request = sent_request(server.next_sent().await);
+                server.frame(WebSocketMessage {
+                    r#type: Some(web_socket_message::Type::Response.into()),
+                    response: Some(WebSocketResponseMessage {
+                        id: Some(request.id()),
+                        status: Some(428),
+                        headers: headers.clone(),
+                        body: Some(
+                            br#"{"token":"a","options":["pushChallenge"]}"#
+                                .to_vec(),
+                        ),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+                request
+            },
+        ));
+        assert_eq!(
+            (request.verb(), request.path()),
+            (
+                "PUT",
+                &*format!("/v1/messages/{}", peer.service_id_string())
+            )
+        );
+        match sent {
+            Err(MessageSenderError::ProofRequired {
+                token,
+                options,
+                retry_after,
+            }) => {
+                assert_eq!(token, "a");
+                assert_eq!(options, ["pushChallenge"]);
+                assert_eq!(retry_after, wait);
+            },
+            other => panic!("{other:?}"),
+        }
     }
 }

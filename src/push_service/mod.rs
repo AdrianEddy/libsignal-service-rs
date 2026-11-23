@@ -45,6 +45,11 @@ pub use transfer_archive::*;
 pub struct ProofRequired {
     pub token: String,
     pub options: Vec<String>,
+    /// The 428's `Retry-After`, saturated as a rate limit's: how long until
+    /// waiting alone lifts the challenge; `None` without one, or with one that
+    /// isn't a number of seconds.
+    #[serde(skip)]
+    pub retry_after: Option<Duration>,
 }
 
 #[derive(derive_more::Debug, Clone, Serialize, Deserialize)]

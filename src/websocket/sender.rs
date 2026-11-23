@@ -1,5 +1,8 @@
 use crate::{
-    push_service::response::error_mapper,
+    push_service::{
+        response::{error_mapper, json_or_unhandled, parse_retry_after},
+        ProofRequired,
+    },
     sender::{OutgoingPushMessages, SendMessageResponse},
     unidentified_access::UnidentifiedAccess,
     utils::BASE64_RELAXED,
@@ -7,6 +10,24 @@ use crate::{
 
 use super::*;
 use base64::Engine;
+
+// 428: the challenge is the body's, the wait that lifts it the `Retry-After`
+// header's, which libsignal-net's chat client reads too (`ws.rs`,
+// `RateLimitChallenge::retry_later`).
+async fn proof_required<R>(response: R) -> ServiceError
+where
+    R: SignalServiceResponse,
+{
+    let retry_after =
+        response.header("retry-after").and_then(parse_retry_after);
+    match json_or_unhandled::<R, ProofRequired>(response).await {
+        Ok(proof) => ServiceError::ProofRequiredError(ProofRequired {
+            retry_after,
+            ..proof
+        }),
+        Err(error) => error,
+    }
+}
 
 // Signal-Server: controllers/MessageController.java:198
 // (PUT /v1/messages/{destination})
@@ -21,7 +42,7 @@ error_mapper! {
         // 404: unregistered recipient, MessageController.java:316
         NOT_FOUND => UnregisteredRecipient,
         // 428: proof required, MessageController.java:365
-        PRECONDITION_REQUIRED => ProofRequiredError(crate::push_service::ProofRequired),
+        PRECONDITION_REQUIRED => fn proof_required,
 }
 
 // Signal-Server: controllers/MessageController.java:466
@@ -36,7 +57,7 @@ error_mapper! {
         // 413: message too large, MessageController.java:660
         PAYLOAD_TOO_LARGE => MessageTooLarge,
         // 428: proof required, MessageController.java:638
-        PRECONDITION_REQUIRED => ProofRequiredError(crate::push_service::ProofRequired),
+        PRECONDITION_REQUIRED => fn proof_required,
 }
 
 impl SignalWebSocket<Identified> {
@@ -79,3 +100,6 @@ impl SignalWebSocket<Unidentified> {
         self.request_json_with(request, put_messages_errors).await
     }
 }
+
+#[cfg(test)]
+mod tests;
