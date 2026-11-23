@@ -145,7 +145,8 @@ impl Peer {
         ServiceCipher::new(
             self.store.clone(),
             vec![],
-            self.address.clone(),
+            self.aci.into(),
+            self.address.device_id(),
             Rc::new(SystemClock),
         )
         .open_envelope(&envelope, &mut rng())

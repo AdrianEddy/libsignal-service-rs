@@ -38,6 +38,8 @@ use crate::{
 pub struct ServiceCipher<S> {
     protocol_store: S,
     trust_roots: Vec<PublicKey>,
+    local_service: ServiceId,
+    /// Our device's address under `local_service`.
     local_address: ProtocolAddress,
     pub(crate) clock: Rc<dyn Clock>,
 }
@@ -87,18 +89,26 @@ impl<S> ServiceCipher<S>
 where
     S: ProtocolStore + SenderKeyStore + SessionStoreExt + Clone,
 {
+    /// The cipher of our device `local_device` under the identity
+    /// `local_service`, our ACI or PNI, whose store `protocol_store` is.
+    ///
     /// Encryption, and the session checks before it, read the time from
     /// `clock`.
     pub fn new(
         protocol_store: S,
         trust_roots: Vec<PublicKey>,
-        local_address: ProtocolAddress,
+        local_service: ServiceId,
+        local_device: DeviceId,
         clock: Rc<dyn Clock>,
     ) -> Self {
         Self {
             protocol_store,
             trust_roots,
-            local_address,
+            local_service,
+            local_address: ServiceId::to_protocol_address(
+                &local_service,
+                local_device,
+            ),
             clock,
         }
     }
@@ -144,9 +154,6 @@ where
         if envelope.content.is_none() {
             return Ok(None);
         }
-        let local_service: ServiceId =
-            ServiceId::parse_from_service_id_string(self.local_address.name())
-                .expect("valid protocol address name");
 
         let Plaintext {
             metadata,
@@ -226,8 +233,8 @@ where
         if matches!(
             message.content,
             Some(crate::proto::content::Content::SyncMessage(_))
-        ) && (metadata.sender.aci() != local_service.aci()
-            || local_service.kind() == ServiceIdKind::Pni)
+        ) && (metadata.sender.aci() != self.local_service.aci()
+            || self.local_service.kind() == ServiceIdKind::Pni)
         {
             tracing::warn!("Source is not ourself.");
             return Ok(None);
@@ -347,10 +354,6 @@ where
         envelope: &Envelope,
         csprng: &mut R,
     ) -> Result<Plaintext, ServiceError> {
-        let local_service: ServiceId =
-            ServiceId::parse_from_service_id_string(self.local_address.name())
-                .expect("valid protocol address name");
-
         let ciphertext = if let Some(msg) = envelope.content.as_ref() {
             msg
         } else {
@@ -373,7 +376,7 @@ where
             });
         };
 
-        if destination_service_id != local_service {
+        if destination_service_id != self.local_service {
             tracing::warn!(
                 "mismatching destination service id; ignoring invalid message."
             );
@@ -536,7 +539,8 @@ where
                     // certificate, and a fast clock would fail a valid one.
                     Timestamp::from_epoch_millis(envelope.server_timestamp()),
                     None,
-                    self.local_address.clone(),
+                    self.local_service,
+                    &self.local_address,
                     &mut self.protocol_store.clone(),
                     &mut self.protocol_store.clone(),
                     &mut self.protocol_store.clone(),
@@ -824,6 +828,7 @@ impl From<SignalProtocolError> for SealedSenderDecryptionError {
     skip(
         ciphertext,
         trust_roots,
+        local_service,
         identity_store,
         session_store,
         pre_key_store,
@@ -841,7 +846,8 @@ async fn sealed_sender_decrypt<R: Rng + CryptoRng>(
     trust_roots: &[PublicKey],
     timestamp: Timestamp,
     local_e164: Option<String>,
-    local_address: ProtocolAddress,
+    local_service: ServiceId,
+    local_address: &ProtocolAddress,
     identity_store: &mut dyn IdentityKeyStore,
     session_store: &mut dyn SessionStore,
     pre_key_store: &mut dyn PreKeyStore,
@@ -866,16 +872,13 @@ async fn sealed_sender_decrypt<R: Rng + CryptoRng>(
         .into());
     }
 
-    let local_service_id =
-        ServiceId::parse_from_service_id_string(local_address.name())
-            .expect("valid protocol address name");
     let sender_uuid: Uuid =
         usmc.sender()?.sender_uuid()?.parse().map_err(|_| {
             SignalProtocolError::InvalidSealedSenderMessage(
                 "invalid sender UUID".to_string(),
             )
         })?;
-    let is_local_uuid = local_service_id.raw_uuid() == sender_uuid;
+    let is_local_uuid = local_service.raw_uuid() == sender_uuid;
 
     let is_local_e164 = match (local_e164, usmc.sender()?.sender_e164()?) {
         (Some(l), Some(s)) => l == s,
@@ -897,7 +900,7 @@ async fn sealed_sender_decrypt<R: Rng + CryptoRng>(
     sealed_sender_decrypt_with_validated_usmc(
         &usmc,
         &remote_address,
-        &local_address,
+        local_address,
         identity_store,
         session_store,
         pre_key_store,

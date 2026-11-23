@@ -11,10 +11,10 @@ use libsignal_protocol::{
     sealed_sender_encrypt, sealed_sender_encrypt_from_usmc, Aci,
     CiphertextMessageType, ContentHint, DeviceId, GenericSignedPreKey as _,
     IdentityKeyPair, IdentityKeyStore as _, InMemSignalProtocolStore, KeyPair,
-    KyberPreKeyRecord, KyberPreKeyStore as _, PreKeyBundle, ProtocolAddress,
-    SenderCertificate, SenderKeyStore as _, ServerCertificate, ServiceId,
-    SignalProtocolError, SignedPreKeyRecord, SignedPreKeyStore as _, Timestamp,
-    UnidentifiedSenderMessageContent,
+    KyberPreKeyRecord, KyberPreKeyStore as _, Pni, PreKeyBundle,
+    ProtocolAddress, SenderCertificate, SenderKeyStore as _, ServerCertificate,
+    ServiceId, SignalProtocolError, SignedPreKeyRecord, SignedPreKeyStore as _,
+    Timestamp, UnidentifiedSenderMessageContent,
 };
 use prost::Message as _;
 use uuid::Uuid;
@@ -68,11 +68,27 @@ impl SessionStoreExt for InMemSignalProtocolStore {
     }
 }
 
+/// The device every account here has.
+fn device() -> DeviceId {
+    DeviceId::new(1).unwrap()
+}
+
+/// The account `id`'s ACI.
+fn aci(id: u128) -> ServiceId {
+    Aci::from(Uuid::from_u128(id)).into()
+}
+
 fn address(id: u128) -> ProtocolAddress {
-    ProtocolAddress::new(
-        Aci::from(Uuid::from_u128(id)).service_id_string(),
-        DeviceId::new(1).unwrap(),
-    )
+    aci(id).to_protocol_address(device())
+}
+
+/// The account `id`'s cipher on `store`, without trust roots.
+fn cipher(
+    store: InMemSignalProtocolStore,
+    id: u128,
+    clock: Rc<dyn Clock>,
+) -> ServiceCipher<InMemSignalProtocolStore> {
+    ServiceCipher::new(store, vec![], aci(id), device(), clock)
 }
 
 fn bundle() -> PreKeyBundle {
@@ -102,20 +118,15 @@ fn bundle() -> PreKeyBundle {
     .unwrap()
 }
 
+/// What the account 1 encrypts to `remote` at `now`.
 async fn encrypt_at(
     store: &InMemSignalProtocolStore,
-    local: &ProtocolAddress,
     remote: &ProtocolAddress,
     now: SystemTime,
 ) -> Result<OutgoingPushMessage, ServiceError> {
-    ServiceCipher::new(
-        store.clone(),
-        vec![],
-        local.clone(),
-        Rc::new(FixedClock(now)),
-    )
-    .encrypt(remote, None, b"hello", &mut rand::rng())
-    .await
+    cipher(store.clone(), 1, Rc::new(FixedClock(now)))
+        .encrypt(remote, None, b"hello", &mut rand::rng())
+        .await
 }
 
 /// A session started from a bundle stays unacknowledged until the peer
@@ -143,12 +154,10 @@ async fn clock_drives_session_staleness() {
     .unwrap();
     let day = Duration::from_secs(24 * 60 * 60);
 
-    let message = encrypt_at(&store, &alice, &bob, started + 29 * day)
-        .await
-        .unwrap();
+    let message = encrypt_at(&store, &bob, started + 29 * day).await.unwrap();
     assert_eq!(message.r#type, Type::PrekeyMessage as u32);
 
-    let stale = encrypt_at(&store, &alice, &bob, started + 31 * day).await;
+    let stale = encrypt_at(&store, &bob, started + 31 * day).await;
     assert!(
         matches!(
             stale,
@@ -299,11 +308,10 @@ async fn alice_to_bob(
     .await
     .unwrap();
     let clock = Rc::new(FixedClock(now));
-    let sent =
-        ServiceCipher::new(alice_store, vec![], alice.clone(), clock.clone())
-            .encrypt(&bob, None, plaintext, rng)
-            .await
-            .unwrap();
+    let sent = cipher(alice_store, 1, clock.clone())
+        .encrypt(&bob, None, plaintext, rng)
+        .await
+        .unwrap();
     let envelope = Envelope {
         r#type: Some(sent.r#type as i32),
         source_service_id: Some(alice.name().to_owned()),
@@ -314,7 +322,7 @@ async fn alice_to_bob(
         content: Some(BASE64_STANDARD.decode(&sent.content).unwrap().into()),
         ..Default::default()
     };
-    (ServiceCipher::new(bob_store, vec![], bob, clock), envelope)
+    (cipher(bob_store, 2, clock), envelope)
 }
 
 /// A sender key distribution message of Alice's, for `distribution_id`.
@@ -530,7 +538,8 @@ async fn sealed_sender_certificate_is_checked_at_the_server_timestamp() {
         let mut cipher = ServiceCipher::new(
             bob_store.clone(),
             vec![trust_root.public_key],
-            bob.clone(),
+            aci(2),
+            device(),
             Rc::new(FixedClock(now)),
         );
         async move { cipher.open_envelope(&envelope, &mut rand::rng()).await }
@@ -601,8 +610,7 @@ async fn unsealed_plaintext(
         ..Default::default()
     };
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let clock = Rc::new(FixedClock(now));
-    (ServiceCipher::new(bob_store, vec![], bob, clock), envelope)
+    (cipher(bob_store, 2, Rc::new(FixedClock(now))), envelope)
 }
 
 /// Bob's cipher, which trusts the root of Alice's sender certificate, and
@@ -661,9 +669,13 @@ async fn sealed_plaintext(
         ..Default::default()
     };
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-    let clock = Rc::new(FixedClock(now));
-    let cipher =
-        ServiceCipher::new(bob_store, vec![trust_root.public_key], bob, clock);
+    let cipher = ServiceCipher::new(
+        bob_store,
+        vec![trust_root.public_key],
+        aci(2),
+        device(),
+        Rc::new(FixedClock(now)),
+    );
     (cipher, envelope)
 }
 
@@ -760,12 +772,8 @@ async fn a_plaintext_with_a_side_car_is_dropped_and_its_sender_key_not_stored()
 async fn an_identified_envelope_without_a_source_is_an_invalid_frame() {
     let bob = address(2);
     let (bob_store, _) = device_with_bundle(&bob).await;
-    let mut cipher = ServiceCipher::new(
-        bob_store,
-        vec![],
-        bob.clone(),
-        Rc::new(FixedClock(SystemTime::UNIX_EPOCH)),
-    );
+    let mut cipher =
+        cipher(bob_store, 2, Rc::new(FixedClock(SystemTime::UNIX_EPOCH)));
     let unreadable = [
         (None, None),
         (Some("not a service id".to_owned()), None),
@@ -865,7 +873,8 @@ async fn a_sealed_sender_that_isnt_a_uuid_is_refused() {
     let mut cipher = ServiceCipher::new(
         bob_store,
         vec![trust_root.public_key],
-        bob,
+        aci(2),
+        device(),
         Rc::new(FixedClock(now)),
     );
     match cipher.decrypt(&envelope, rng).await {
@@ -879,5 +888,149 @@ async fn a_sealed_sender_that_isnt_a_uuid_is_refused() {
         ),
         Err(error) => panic!("{error:?}"),
         Ok(_) => panic!("decrypted"),
+    }
+}
+
+/// Bob's cipher, which trusts the root of the sender's certificate, and a
+/// sealed message of `plaintext` (a serialized `Content`) to him from the
+/// account `sender`'s device.
+async fn sealed_to_bob(
+    sender: u128,
+    plaintext: &[u8],
+) -> (ServiceCipher<InMemSignalProtocolStore>, Envelope) {
+    let rng = &mut rand::rng();
+    let (from, bob) = (address(sender), address(2));
+    let (bob_store, bob_bundle) = device_with_bundle(&bob).await;
+    let identity = IdentityKeyPair::generate(rng);
+    let mut store = InMemSignalProtocolStore::new(identity, 1).unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    process_prekey_bundle(
+        &bob,
+        &from,
+        &mut store.session_store,
+        &mut store.identity_store,
+        &bob_bundle,
+        now,
+        rng,
+    )
+    .await
+    .unwrap();
+    let trust_root = KeyPair::generate(rng);
+    let server_key = KeyPair::generate(rng);
+    let certificate = SenderCertificate::new(
+        from.name().to_owned(),
+        None,
+        *identity.public_key(),
+        from.device_id(),
+        Timestamp::from_epoch_millis(1_800_000_000_000),
+        ServerCertificate::new(
+            1,
+            server_key.public_key,
+            &trust_root.private_key,
+            rng,
+        )
+        .unwrap(),
+        &server_key.private_key,
+        rng,
+    )
+    .unwrap();
+    let sealed = sealed_sender_encrypt(
+        &bob,
+        &certificate,
+        &add_padding(4, plaintext).unwrap(),
+        &mut store.session_store,
+        &mut store.identity_store,
+        now,
+        rng,
+    )
+    .await
+    .unwrap();
+    let envelope = Envelope {
+        r#type: Some(Type::UnidentifiedSender.into()),
+        destination_service_id: Some(bob.name().to_owned()),
+        client_timestamp: Some(1_700_000_000_000),
+        server_timestamp: Some(1_700_000_000_001),
+        content: Some(sealed.into()),
+        ..Default::default()
+    };
+    let cipher = ServiceCipher::new(
+        bob_store,
+        vec![trust_root.public_key],
+        aci(2),
+        device(),
+        Rc::new(FixedClock(now)),
+    );
+    (cipher, envelope)
+}
+
+/// A cipher is of the identity and the device it is given, as typed: it opens
+/// what names that identity, ACI or PNI, and nothing else, and knows its own
+/// device in a sealed message's certificate.
+#[tokio::test]
+async fn a_cipher_is_of_the_identity_and_device_it_is_given() {
+    let rng = &mut rand::rng();
+    let pni = ServiceId::from(Pni::from(Uuid::from_u128(2)));
+    let third = DeviceId::new(3).unwrap();
+    let local = pni.to_protocol_address(third);
+    let (store, bundle) = device_with_bundle(&local).await;
+    let mut alice =
+        InMemSignalProtocolStore::new(IdentityKeyPair::generate(rng), 1)
+            .unwrap();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    process_prekey_bundle(
+        &local,
+        &address(1),
+        &mut alice.session_store,
+        &mut alice.identity_store,
+        &bundle,
+        now,
+        rng,
+    )
+    .await
+    .unwrap();
+    let clock = Rc::new(FixedClock(now));
+    let sent = cipher(alice, 1, clock.clone())
+        .encrypt(&local, None, &[], rng)
+        .await
+        .unwrap();
+    let mut ours = ServiceCipher::new(store, vec![], pni, third, clock);
+    assert!(format!("{ours:?}").contains(&format!("{local:?}")));
+    for (destination, opens) in [(aci(2), false), (pni, true)] {
+        let envelope = Envelope {
+            r#type: Some(sent.r#type as i32),
+            source_service_id: Some(address(1).name().to_owned()),
+            source_device_id: Some(1),
+            destination_service_id: Some(destination.service_id_string()),
+            content: Some(
+                BASE64_STANDARD.decode(&sent.content).unwrap().into(),
+            ),
+            ..Default::default()
+        };
+        match ours.open_envelope(&envelope, rng).await {
+            Ok(Some(opened)) => {
+                assert!(opens);
+                assert_eq!(opened.metadata.destination, pni);
+            },
+            Err(ServiceError::InvalidFrame { reason }) => {
+                assert!(!opens, "{reason}");
+                assert_eq!(reason, "mismatch destination service id");
+            },
+            other => panic!("{other:?}"),
+        }
+    }
+
+    for (sender, self_send) in [(1, false), (2, true)] {
+        let (mut bob, envelope) = sealed_to_bob(sender, &[]).await;
+        match bob.open_envelope(&envelope, rng).await {
+            Ok(Some(_)) => assert!(!self_send),
+            Err(ServiceError::SealedSenderDecryptionError(error)) => {
+                assert!(self_send, "{error:?}");
+                assert!(matches!(
+                    error.inner,
+                    SignalProtocolError::SealedSenderSelfSend
+                ));
+            },
+            other => panic!("{other:?}"),
+        }
     }
 }

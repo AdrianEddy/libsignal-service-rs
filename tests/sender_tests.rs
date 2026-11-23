@@ -138,7 +138,8 @@ fn sent_transcript_free_fn_equals_method_output() {
     let cipher = ServiceCipher::new(
         ours.clone(),
         vec![],
-        our_aci.to_protocol_address(device(2)).unwrap(),
+        our_aci.into(),
+        device(2),
         clock.clone(),
     );
     let mut sender = MessageSender::new(
@@ -236,7 +237,8 @@ fn sent_transcript_free_fn_equals_method_output() {
             ServiceCipher::new(
                 primary,
                 vec![],
-                our_aci.to_protocol_address(device(1)).unwrap(),
+                our_aci.into(),
+                device(1),
                 clock,
             )
             .open_envelope(&envelope, rng),
@@ -417,8 +419,14 @@ fn pni_signature_free_fn_verifies() {
         ..Default::default()
     };
     let message = block_on(
-        ServiceCipher::new(alice_store, vec![], alice.clone(), clock.clone())
-            .encrypt(&bob, None, &content.encode_to_vec(), rng),
+        ServiceCipher::new(
+            alice_store,
+            vec![],
+            alice_aci.into(),
+            device(1),
+            clock.clone(),
+        )
+        .encrypt(&bob, None, &content.encode_to_vec(), rng),
     )
     .unwrap();
     assert_eq!(message.r#type, Type::PrekeyMessage as u32);
@@ -433,7 +441,7 @@ fn pni_signature_free_fn_verifies() {
         ..Default::default()
     };
     let opened = block_on(
-        ServiceCipher::new(bob_store, vec![], bob, clock)
+        ServiceCipher::new(bob_store, vec![], bob_aci.into(), device(1), clock)
             .open_envelope(&envelope, rng),
     )
     .unwrap()
@@ -525,9 +533,8 @@ fn encrypt_needs_a_session_the_official_clients_send_on() {
     let rng = &mut rand::rng();
     let clock = Rc::new(ManualClock::default());
     let now = clock.now();
-    let alice = Aci::from(Uuid::from_u128(0xa1))
-        .to_protocol_address(device(1))
-        .unwrap();
+    let alice_aci = Aci::from(Uuid::from_u128(0xa1));
+    let alice = alice_aci.to_protocol_address(device(1)).unwrap();
     let alice_store = LocalStore::new(IdentityKeyPair::generate(rng), 1);
     let bob = Aci::from(Uuid::from_u128(0xb0b))
         .to_protocol_address(device(1))
@@ -555,8 +562,14 @@ fn encrypt_needs_a_session_the_official_clients_send_on() {
         let mut store = alice_store.clone();
         block_on(store.store_session(&bob, record)).unwrap();
         block_on(
-            ServiceCipher::new(store, vec![], alice.clone(), clock.clone())
-                .encrypt(&bob, None, b"hello", &mut rand::rng()),
+            ServiceCipher::new(
+                store,
+                vec![],
+                alice_aci.into(),
+                device(1),
+                clock.clone(),
+            )
+            .encrypt(&bob, None, b"hello", &mut rand::rng()),
         )
     };
     let without_spqr = edit_active_session(&built, |session| {
