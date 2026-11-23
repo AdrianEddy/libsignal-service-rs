@@ -1,4 +1,4 @@
-use std::{convert::TryFrom, fmt, rc::Rc};
+use std::{convert::TryFrom, fmt, rc::Rc, sync::Arc};
 
 use aes::cipher::block_padding::{Iso7816, Padding};
 use base64::prelude::*;
@@ -135,7 +135,9 @@ where
     ///
     /// A PNI signature is verified during decryption and, when valid, its
     /// PNI is exposed as `Metadata::pni_verified`, on a message without a
-    /// `body` too.
+    /// `body` too. A store error while verifying it is exposed there as well,
+    /// and the message is passed on. One while applying a sender key
+    /// distribution fails the envelope.
     ///
     /// A plaintext's side-cars are never taken: no session authenticates
     /// them.
@@ -266,65 +268,66 @@ where
     }
 
     /// Verify a `PniSignatureMessage` sidecar against the sender's stored identity keys.
+    ///
+    /// `Ok(None)` for one that doesn't verify. `Err` is the store's alone: read
+    /// as "no identity", it would cost the message its PNI for good.
     async fn verify_pni_signature(
         &self,
         sender: ServiceId,
         sender_device: DeviceId,
         pni_signature: &PniSignatureMessage,
-    ) -> Option<Pni> {
+    ) -> Result<Option<Pni>, SignalProtocolError> {
         let Some(sender_aci) = sender.aci() else {
             tracing::warn!("ignoring PNI signature: source is not an ACI");
-            return None;
+            return Ok(None);
         };
 
-        let Some(pni) =
-            Pni::parse_from_service_id_binary(pni_signature.pni.as_deref()?)
-        else {
+        let (Some(pni), Some(signature)) = (
+            pni_signature.pni.as_deref(),
+            pni_signature.signature.as_deref(),
+        ) else {
+            return Ok(None);
+        };
+        let Some(pni) = Pni::parse_from_service_id_binary(pni) else {
             tracing::warn!("ignoring PNI signature: unparseable PNI");
-            return None;
+            return Ok(None);
         };
-        let signature = pni_signature.signature.as_deref()?;
 
-        let aci_address = sender_aci.to_protocol_address(sender_device).ok()?;
-        let aci_identity = self
-            .protocol_store
-            .get_identity(&aci_address)
-            .await
-            .ok()
-            .flatten()?;
+        let aci_address =
+            ServiceId::to_protocol_address(&sender, sender_device);
+        let Some(aci_identity) =
+            self.protocol_store.get_identity(&aci_address).await?
+        else {
+            return Ok(None);
+        };
 
-        let pni_address = pni.to_protocol_address(sender_device).ok()?;
-        let pni_identity =
-            match self.protocol_store.get_identity(&pni_address).await {
-                Ok(Some(id)) => id,
-                _ => {
-                    if sender_device == *DEFAULT_DEVICE_ID {
-                        tracing::warn!(
-                            "ignoring PNI signature: no PNI identity known"
-                        );
-                        return None;
-                    }
-                    // The PNI identity is recorded under the primary device.
-                    let primary =
-                        pni.to_protocol_address(*DEFAULT_DEVICE_ID).ok()?;
-                    match self.protocol_store.get_identity(&primary).await {
-                        Ok(Some(id)) => id,
-                        _ => {
-                            tracing::warn!(
-                                "ignoring PNI signature: no PNI identity known"
-                            );
-                            return None;
-                        },
-                    }
-                },
-            };
+        let pni_service = ServiceId::from(pni);
+        let pni_address =
+            ServiceId::to_protocol_address(&pni_service, sender_device);
+        let mut pni_identity =
+            self.protocol_store.get_identity(&pni_address).await?;
+        if pni_identity.is_none() && sender_device != *DEFAULT_DEVICE_ID {
+            // The PNI identity is recorded under the primary device.
+            let primary = ServiceId::to_protocol_address(
+                &pni_service,
+                *DEFAULT_DEVICE_ID,
+            );
+            pni_identity = self.protocol_store.get_identity(&primary).await?;
+        }
+        let Some(pni_identity) = pni_identity else {
+            tracing::warn!("ignoring PNI signature: no PNI identity known");
+            return Ok(None);
+        };
 
-        let verified = pni_identity
+        let verified = match pni_identity
             .verify_alternate_identity(&aci_identity, signature)
-            .inspect_err(|e| {
+        {
+            Ok(verified) => verified,
+            Err(e) => {
                 tracing::warn!(?e, "PNI signature verification error");
-            })
-            .ok()?;
+                return Ok(None);
+            },
+        };
 
         if verified {
             tracing::info!(
@@ -332,14 +335,14 @@ where
                 pni = %pni.service_id_string(),
                 "verified PNI signature"
             );
-            Some(pni)
+            Ok(Some(pni))
         } else {
             tracing::warn!(
                 aci = %sender_aci.service_id_string(),
                 pni = %pni.service_id_string(),
                 "invalid PNI signature"
             );
-            None
+            Ok(None)
         }
     }
 
@@ -588,17 +591,17 @@ where
 
         let message = crate::proto::Content::decode(parts.data.as_slice())?;
         // A plaintext's side-car is never taken (`open_envelope`), so it
-        // isn't verified either.
+        // isn't verified either. The message is decrypted by now, so a store
+        // error is passed on beside it and doesn't fail the envelope.
         let pni_verified = match &message.pni_signature_message {
-            Some(msg) if !parts.was_plaintext => {
-                self.verify_pni_signature(
-                    parts.sender,
-                    parts.sender_device,
-                    msg,
-                )
+            Some(msg) if !parts.was_plaintext => self
+                .verify_pni_signature(parts.sender, parts.sender_device, msg)
                 .await
-            },
-            _ => None,
+                .inspect_err(|error| {
+                    tracing::warn!(%error, "couldn't verify a PNI signature")
+                })
+                .map_err(Arc::new),
+            _ => Ok(None),
         };
         let metadata = Metadata {
             destination: destination_service_id,

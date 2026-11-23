@@ -3,7 +3,14 @@
 //! [`MessageSender`](libsignal_service::sender::MessageSender) clone their
 //! store for every call, so a session they store must outlive the clone.
 
-use std::{ops::Deref, rc::Rc, sync::Arc, time::SystemTime};
+use std::{
+    error::Error,
+    fmt,
+    ops::Deref,
+    rc::Rc,
+    sync::{self, Arc},
+    time::SystemTime,
+};
 
 use async_trait::async_trait;
 use futures::lock::Mutex;
@@ -24,9 +31,22 @@ use uuid::Uuid;
 
 type StoreResult<T> = Result<T, SignalProtocolError>;
 
-/// A store whose clones share one state behind `P`.
+/// A store whose clones share one state behind `P`, and the addresses whose
+/// identity it fails to read.
 #[derive(Clone)]
-pub struct SharedStore<P>(P);
+pub struct SharedStore<P>(P, Arc<sync::Mutex<Vec<ProtocolAddress>>>);
+
+/// The error of a read the test makes fail.
+#[derive(Debug)]
+pub struct StoreFailure;
+
+impl fmt::Display for StoreFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the store failed")
+    }
+}
+
+impl Error for StoreFailure {}
 
 /// Not `Sync`, as MultiChat's `SignalStore<'_>` isn't.
 pub type LocalStore = SharedStore<Rc<Mutex<InMemSignalProtocolStore>>>;
@@ -36,9 +56,16 @@ pub type SyncStore = SharedStore<Arc<Mutex<InMemSignalProtocolStore>>>;
 
 impl<P: From<Mutex<InMemSignalProtocolStore>>> SharedStore<P> {
     pub fn new(identity: IdentityKeyPair, registration_id: u32) -> Self {
-        Self(P::from(Mutex::new(
-            InMemSignalProtocolStore::new(identity, registration_id).unwrap(),
-        )))
+        let store =
+            InMemSignalProtocolStore::new(identity, registration_id).unwrap();
+        Self(P::from(Mutex::new(store)), Arc::default())
+    }
+}
+
+impl<P> SharedStore<P> {
+    /// From now on, reading `address`'s identity is a [`StoreFailure`].
+    pub fn fail_identity_of(&self, address: ProtocolAddress) {
+        self.1.lock().unwrap().push(address);
     }
 }
 
@@ -157,6 +184,12 @@ impl<P: Deref<Target = Mutex<InMemSignalProtocolStore>>> IdentityKeyStore
         &self,
         address: &ProtocolAddress,
     ) -> StoreResult<Option<IdentityKey>> {
+        if self.1.lock().unwrap().contains(address) {
+            return Err(SignalProtocolError::ApplicationCallbackError(
+                "get_identity",
+                Box::new(StoreFailure),
+            ));
+        }
         self.0.lock().await.get_identity(address).await
     }
 }

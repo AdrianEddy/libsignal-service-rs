@@ -1,8 +1,10 @@
 use bytes::Bytes;
 use libsignal_core::DeviceId;
-use libsignal_protocol::{Pni, ProtocolAddress, ServiceId};
+use libsignal_protocol::{
+    Pni, ProtocolAddress, ServiceId, SignalProtocolError,
+};
 use prost::Message;
-use std::fmt;
+use std::{fmt, sync::Arc};
 use uuid::Uuid;
 
 pub use crate::{
@@ -25,8 +27,15 @@ pub struct Metadata {
     pub sender: ServiceId,
     pub destination: ServiceId,
     pub sender_device: DeviceId,
-    /// Contains the PNI of the sender if verification was succesfull
-    pub pni_verified: Option<Pni>,
+    /// The sender's PNI, when a PNI signature came with the message and
+    /// verified; `Ok(None)` without one, or with one that doesn't verify.
+    ///
+    /// `Err` is the store's error that kept one from being verified. The
+    /// message decrypted all the same, so it is passed on, and the caller says
+    /// what the error costs: one whose store takes the decrypt back can fail
+    /// the envelope and have the signature verified when it comes again; taken
+    /// as `Ok(None)`, it costs the PNI.
+    pub pni_verified: Result<Option<Pni>, Arc<SignalProtocolError>>,
 
     /// When the sender says it sent the message, in milliseconds since the
     /// epoch: its word as the envelope carries it, so any `u64`.

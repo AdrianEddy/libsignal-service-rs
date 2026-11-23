@@ -378,7 +378,7 @@ async fn open_envelope_keeps_the_senders_bytes() {
         opened.metadata.sender.service_id_string(),
         address(1).name()
     );
-    assert_eq!(opened.metadata.pni_verified, None);
+    assert_eq!(opened.metadata.pni_verified.unwrap(), None);
 }
 
 /// A plaintext that holds no content of a kind this crate knows comes back

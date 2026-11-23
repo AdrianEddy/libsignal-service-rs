@@ -450,7 +450,7 @@ fn pni_signature_free_fn_verifies() {
     )
     .unwrap()
     .expect("content");
-    assert_eq!(opened.metadata.pni_verified, Some(pni));
+    assert_eq!(opened.metadata.pni_verified.unwrap(), Some(pni));
 }
 
 /// A protobuf message's fields, as (number, wire type, value), where a
