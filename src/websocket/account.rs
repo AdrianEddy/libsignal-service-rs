@@ -148,12 +148,37 @@ impl SignalWebSocket<websocket::Identified> {
         Ok(devices.devices)
     }
 
+    /// Sets the account's attributes, the primary device's to set.
+    ///
+    /// A linked device must never send this request: from it Signal-Server
+    /// also sets the account's registration lock (cleared when left out), its
+    /// unidentified access key, unrestricted access and discoverability
+    /// (`AccountController.setAccountAttributes`), which a linked device
+    /// doesn't know. As the official clients do, it registers its capabilities
+    /// with [`set_capabilities`](Self::set_capabilities) instead.
     pub async fn set_account_attributes(
         &mut self,
         attributes: AccountAttributes,
     ) -> Result<(), ServiceError> {
         self.http_request(Method::PUT, "/v1/accounts/attributes")?
             .send_json(&attributes)
+            .await?
+            .service_error_for_status()
+            .await?;
+
+        Ok(())
+    }
+
+    /// Registers this device's capabilities, by name, in place of the set
+    /// Signal-Server holds for it (`PUT /v1/devices/capabilities`,
+    /// `DeviceController.setCapabilities`): one left out, or `false`, is one
+    /// the device no longer has. Nothing of the account changes.
+    pub async fn set_capabilities(
+        &mut self,
+        capabilities: &BTreeMap<String, bool>,
+    ) -> Result<(), ServiceError> {
+        self.http_request(Method::PUT, "/v1/devices/capabilities")?
+            .send_json(capabilities)
             .await?
             .service_error_for_status()
             .await?;

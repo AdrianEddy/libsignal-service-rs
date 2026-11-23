@@ -619,6 +619,10 @@ impl AccountManager {
     /// Set profile attributes
     ///
     /// Signal Android does not allow unsetting voice/video.
+    ///
+    /// The primary device's to call: see
+    /// [`SignalWebSocket::set_account_attributes`] for what it would reset
+    /// from a linked device.
     pub async fn set_account_attributes(
         &mut self,
         attributes: AccountAttributes,
