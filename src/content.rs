@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use chrono::Utc;
 use libsignal_core::DeviceId;
 use libsignal_protocol::{Pni, ProtocolAddress, ServiceId};
 use prost::Message;
@@ -29,8 +28,12 @@ pub struct Metadata {
     /// Contains the PNI of the sender if verification was succesfull
     pub pni_verified: Option<Pni>,
 
-    pub client_timestamp: chrono::DateTime<Utc>,
-    pub server_timestamp: chrono::DateTime<Utc>,
+    /// When the sender says it sent the message, in milliseconds since the
+    /// epoch: its word as the envelope carries it, so any `u64`.
+    /// Signal-Server takes up to 8.64e15, more than a calendar type may hold.
+    pub client_timestamp: u64,
+    /// When the server says it took the message, the same way.
+    pub server_timestamp: u64,
     pub needs_receipt: bool,
     pub unidentified_sender: bool,
     pub was_plaintext: bool,

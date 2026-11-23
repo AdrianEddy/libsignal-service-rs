@@ -1034,3 +1034,61 @@ async fn a_cipher_is_of_the_identity_and_device_it_is_given() {
         }
     }
 }
+
+/// A timestamp past what chrono holds (about 8.21e15 ms), which a sender may
+/// state, since Signal-Server takes one up to 8.64e15, costs nothing: the
+/// envelope opens, sealed or not, and says what it said, where it failed after
+/// the decrypt had moved the session on, and the message was lost.
+#[tokio::test]
+async fn a_timestamp_past_chronos_range_keeps_the_message() {
+    let text = proto::Content {
+        content: Some(proto::content::Content::DataMessage(
+            proto::DataMessage {
+                body: Some("from the far future".into()),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    // Signal-Server's `MessageController.MAX_TIMESTAMP`, then what an `i64`
+    // holds as negative.
+    for timestamp in [8_640_000_000_000_000, 1 << 63, u64::MAX] {
+        for (mut bob, envelope) in
+            [alice_to_bob(&text).await, sealed_to_bob(1, &text).await]
+        {
+            let envelope = Envelope {
+                client_timestamp: Some(timestamp),
+                ..envelope
+            };
+            let opened = bob
+                .open_envelope(&envelope, &mut rand::rng())
+                .await
+                .unwrap()
+                .expect("opened");
+            assert_eq!(opened.plaintext, text);
+            assert_eq!(opened.metadata.client_timestamp, timestamp);
+            assert_eq!(opened.metadata.server_timestamp, 1_700_000_000_001);
+            match opened.body {
+                Some(ContentBody::DataMessage(message)) => assert_eq!(
+                    message.body.as_deref(),
+                    Some("from the far future")
+                ),
+                other => panic!("{other:?}"),
+            }
+        }
+
+        // The server's own, at which a sealed sender's certificate is checked.
+        let (mut bob, envelope) = alice_to_bob(&text).await;
+        let envelope = Envelope {
+            server_timestamp: Some(timestamp),
+            ..envelope
+        };
+        let opened = bob
+            .open_envelope(&envelope, &mut rand::rng())
+            .await
+            .unwrap()
+            .expect("opened");
+        assert_eq!(opened.metadata.server_timestamp, timestamp);
+    }
+}

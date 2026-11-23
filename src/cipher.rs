@@ -408,22 +408,6 @@ where
             }
         }
 
-        // Extract both kinds of timestamps.
-        // Note that we do not `?` here, but rather only later, in case we ever have a branch which
-        // is not concerned with envelope metadata.
-        let client_timestamp = chrono::DateTime::from_timestamp_millis(
-            envelope.client_timestamp() as i64,
-        )
-        .ok_or(ServiceError::InvalidFrame {
-            reason: "unparseable timestamp",
-        });
-        let server_timestamp = chrono::DateTime::from_timestamp_millis(
-            envelope.server_timestamp() as i64,
-        )
-        .ok_or(ServiceError::InvalidFrame {
-            reason: "unparseable server timestamp",
-        });
-
         /// Decrypted bytes plus the [`Metadata`] fields that vary by envelope type.
         struct DecryptedPayload {
             data: Vec<u8>,
@@ -620,8 +604,8 @@ where
             destination: destination_service_id,
             sender: parts.sender,
             sender_device: parts.sender_device,
-            client_timestamp: client_timestamp?,
-            server_timestamp: server_timestamp?,
+            client_timestamp: envelope.client_timestamp(),
+            server_timestamp: envelope.server_timestamp(),
             needs_receipt: parts.needs_receipt,
             unidentified_sender: parts.unidentified_sender,
             was_plaintext: parts.was_plaintext,
