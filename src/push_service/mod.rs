@@ -18,6 +18,7 @@ use http::{
     HeaderMap, HeaderName, HeaderValue, Method,
 };
 use libsignal_core::DeviceId;
+use rand::{CryptoRng, Rng};
 use serde::{Deserialize, Serialize};
 use tracing::{debug_span, Instrument};
 
@@ -172,13 +173,15 @@ impl PushService {
     /// are [`ServiceError::MissingCredentials`].
     ///
     /// Returns the socket's handle and its task, which the caller runs and
-    /// `clock` times (see [`SignalWebSocket::new`]).
+    /// `clock` times; the socket's request ids come from a generator seeded
+    /// from `csprng` (see [`SignalWebSocket::new`]).
     pub async fn ws<C: WebSocketType>(
         &self,
         path: &str,
         keepalive_path: &str,
         additional_headers: &[(&'static str, &str)],
         credentials: Option<ServiceCredentials>,
+        csprng: &mut (impl Rng + CryptoRng),
         clock: Rc<dyn Clock>,
     ) -> Result<
         (
@@ -224,6 +227,7 @@ impl PushService {
             upgrade,
             keepalive_path.to_owned(),
             unidentified_push_service,
+            csprng,
             clock,
         );
         Ok((ws, task.instrument(span)))

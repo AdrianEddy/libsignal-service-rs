@@ -2,6 +2,7 @@ use std::{future::Future, rc::Rc};
 
 use aes::cipher::block_padding;
 use bytes::{Buf, Bytes};
+use rand::{CryptoRng, Rng};
 
 use crate::{
     attachment_cipher::{decrypt_in_place, AttachmentCipherError},
@@ -27,13 +28,15 @@ impl MessageReceiver {
     }
 
     /// Opens the account's WebSocket and its message pipe. The caller runs
-    /// the socket's task (see [`SignalWebSocket::new`]).
+    /// the socket's task; the socket's request ids come from a generator
+    /// seeded from `csprng` (see [`SignalWebSocket::new`]).
     ///
     /// [`SignalWebSocket::new`]: crate::websocket::SignalWebSocket::new
-    pub async fn create_message_pipe(
+    pub async fn create_message_pipe<R: Rng + CryptoRng>(
         &self,
         credentials: ServiceCredentials,
         allow_stories: bool,
+        csprng: &mut R,
         clock: Rc<dyn Clock>,
     ) -> Result<
         (
@@ -53,6 +56,7 @@ impl MessageReceiver {
                 "/v1/keepalive",
                 headers,
                 Some(credentials),
+                csprng,
                 clock,
             )
             .await?;

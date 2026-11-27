@@ -10,6 +10,7 @@ use futures::channel::{mpsc, oneshot};
 use futures::prelude::*;
 use futures::stream::{FusedStream, FuturesUnordered};
 use http::{HeaderMap, Method};
+use rand::{rngs::StdRng, CryptoRng, Rng, SeedableRng};
 use tracing::debug;
 
 use crate::prelude::PushService;
@@ -187,6 +188,10 @@ struct SignalWebSocketProcess {
 
     /// Times the keepalive.
     clock: Rc<dyn Clock>,
+
+    /// Draws the ids of the application's requests and of the keepalives:
+    /// the socket's own, seeded from the caller's generator.
+    rng: StdRng,
 }
 
 impl SignalWebSocketProcess {
@@ -290,12 +295,18 @@ impl SignalWebSocketProcess {
         }
     }
 
-    fn next_request_id(&self) -> u64 {
-        use rand::Rng;
-        let mut rng = rand::rng();
+    /// Whether a request of ours with id `id` is in flight: the
+    /// application's or a keepalive. A response finds its request by id.
+    fn in_flight(&self, id: u64) -> bool {
+        self.outgoing_requests.contains_key(&id)
+            || self.outgoing_keep_alive_set.contains(&id)
+    }
+
+    /// An id no request in flight has, drawn from the socket's generator.
+    fn next_request_id(&mut self) -> u64 {
         loop {
-            let id = rng.random();
-            if !self.outgoing_requests.contains_key(&id) {
+            let id = self.rng.random();
+            if !self.in_flight(id) {
                 return id;
             }
         }
@@ -335,7 +346,19 @@ impl SignalWebSocketProcess {
             .fuse();
 
         loop {
-            futures::select! {
+            // The first ready branch in this order, never one picked at random
+            // (`select!` picks from a thread-local generator no seed reaches),
+            // so that a seeded caller's socket sends its frames in one order
+            // with the same ids: the keepalive, the answers to Signal, the
+            // application's requests, then the server's frames. Frames come
+            // last because the server's stream alone is unbounded; the others
+            // are bounded by what the task holds (a keepalive an interval, an
+            // answer for each request read, the requests waiting), so each
+            // poll writes what is ready, then reads, and a busy stream holds
+            // back neither the keepalive nor the answers that keep the
+            // server's window moving. Answers go before requests so that the
+            // application's requests don't hold back the answers either.
+            futures::select_biased! {
                 () = keep_alive => {
                     use prost::Message;
                     if !self.outgoing_keep_alive_set.is_empty() {
@@ -363,19 +386,46 @@ impl SignalWebSocketProcess {
                         .sleep(push_service::KEEPALIVE_TIMEOUT_SECONDS)
                         .fuse();
                 },
+                // The set is terminated while empty, which turns this branch off
+                // until the next push.
+                response = self.outgoing_responses.select_next_some() => {
+                    use prost::Message;
+                    match response {
+                        Ok(response) => {
+                            tracing::trace!("sending response {:?}", response);
+
+                            let msg = WebSocketMessage {
+                                r#type: Some(web_socket_message::Type::Response.into()),
+                                response: Some(response),
+                                ..Default::default()
+                            };
+                            let buffer = msg.encode_to_vec();
+                            self.ws.send(Bytes::from(buffer)).await?;
+                        }
+                        // A dropped responder answers nothing: the server
+                        // keeps a delivery queued and sends it again on a
+                        // later connection.
+                        Err(oneshot::Canceled) => {
+                            tracing::trace!("Signal's request left unanswered");
+                        }
+                    }
+                    if self.is_released() {
+                        debug!("every handle dropped and Signal answered; websocket closing");
+                        return Ok(SocketEnd::Released);
+                    }
+                }
                 // Process requests from the application, forward them to Signal
                 x = self.requests.next() => {
                     match x {
                         Some((mut request, responder)) => {
                             use prost::Message;
 
-                            // Regenerate ID if already in the table
-                            request.id = Some(
-                                request
-                                    .id
-                                    .filter(|x| !self.outgoing_requests.contains_key(x))
-                                    .unwrap_or_else(|| self.next_request_id()),
-                            );
+                            // The caller's id, unless a request in flight
+                            // has it.
+                            request.id = Some(match request.id {
+                                Some(id) if !self.in_flight(id) => id,
+                                _ => self.next_request_id(),
+                            });
                             tracing::trace!(
                                 request.id,
                                 request.verb,
@@ -421,34 +471,6 @@ impl SignalWebSocketProcess {
                         }
                     }
                 }
-                // The set is terminated while empty, which turns this branch off
-                // until the next push.
-                response = self.outgoing_responses.select_next_some() => {
-                    use prost::Message;
-                    match response {
-                        Ok(response) => {
-                            tracing::trace!("sending response {:?}", response);
-
-                            let msg = WebSocketMessage {
-                                r#type: Some(web_socket_message::Type::Response.into()),
-                                response: Some(response),
-                                ..Default::default()
-                            };
-                            let buffer = msg.encode_to_vec();
-                            self.ws.send(Bytes::from(buffer)).await?;
-                        }
-                        // A dropped responder answers nothing: the server
-                        // keeps a delivery queued and sends it again on a
-                        // later connection.
-                        Err(oneshot::Canceled) => {
-                            tracing::trace!("Signal's request left unanswered");
-                        }
-                    }
-                    if self.is_released() {
-                        debug!("every handle dropped and Signal answered; websocket closing");
-                        return Ok(SocketEnd::Released);
-                    }
-                }
             }
         }
     }
@@ -462,6 +484,16 @@ impl<C: WebSocketType> SignalWebSocket<C> {
     /// on `clock`, matches responses to requests and passes Signal's requests
     /// to the request stream. lss spawns nothing: the caller runs the task, and
     /// the socket does nothing until it does.
+    ///
+    /// The ids of the application's requests and of the keepalives come from
+    /// a generator of the socket's own, seeded once from `csprng`, and the
+    /// task takes what is ready at one poll in a stated order: the keepalive,
+    /// the answers to Signal, the application's requests, then the server's
+    /// frames. So a caller whose generator is seeded, on an executor that
+    /// polls in one order, gets the same ids in the same order from one run
+    /// to the next. An id no request in flight has is drawn for a request
+    /// without one, or whose id a request in flight already has, a
+    /// keepalive's included.
     ///
     /// The task resolves to why the socket ended, which the caller logs. It
     /// ends with:
@@ -492,12 +524,16 @@ impl<C: WebSocketType> SignalWebSocket<C> {
     ///
     /// However the task ends, and if it is dropped, the connection closes and
     /// requests still waiting fail with [`ServiceError::WsClosing`].
-    pub fn new(
+    pub fn new<R: Rng + CryptoRng>(
         upgrade: WsUpgrade,
         keep_alive_path: String,
         unidentified_push_service: PushService,
+        csprng: &mut R,
         clock: Rc<dyn Clock>,
-    ) -> (Self, impl Future<Output = Result<SocketEnd, ServiceError>>) {
+    ) -> (
+        Self,
+        impl Future<Output = Result<SocketEnd, ServiceError>> + 'static,
+    ) {
         let WsUpgrade {
             headers: upgrade_headers,
             connection,
@@ -518,6 +554,7 @@ impl<C: WebSocketType> SignalWebSocket<C> {
             outgoing_responses: FuturesUnordered::new(),
             ws: connection,
             clock,
+            rng: StdRng::from_rng(csprng),
         };
 
         (

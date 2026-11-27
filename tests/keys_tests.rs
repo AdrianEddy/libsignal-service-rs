@@ -48,6 +48,7 @@ fn the_upload_names_its_keys_as_signal_server_reads_them() {
             "/v1/keepalive",
             &[],
             Some(credentials()),
+            &mut rand::rng(),
             Rc::new(ManualClock::default()),
         ))
         .unwrap();
@@ -152,6 +153,7 @@ fn a_refresh_uploads_the_current_last_resort_key() {
             "/v1/keepalive",
             &[],
             Some(credentials()),
+            &mut rand::rng(),
             clock.clone(),
         ))
         .unwrap();

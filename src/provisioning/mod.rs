@@ -215,10 +215,11 @@ pub struct NewDeviceRegistration {
 
 /// Links this device to an account: opens the provisioning socket, sends its
 /// link to `tx`, waits for the primary device's provisioning message and
-/// registers the device. The socket's task runs beside these steps, timed by
-/// `clock`, and ends with them. If the socket ends before the steps that need
-/// it, the error is why it ended: [`ProvisioningError::SocketEnded`], or the
-/// socket's failure as a [`ProvisioningError::ServiceError`].
+/// registers the device. Everything it draws comes from `csprng`, the
+/// socket's request ids included. The socket's task runs beside these steps,
+/// timed by `clock`, and ends with them. If the socket ends before the steps
+/// that need it, the error is why it ended: [`ProvisioningError::SocketEnded`],
+/// or the socket's failure as a [`ProvisioningError::ServiceError`].
 ///
 /// The link carries `link_capabilities` (see [`ProvisioningPipe::from_socket`]).
 /// `capabilities` is the device's capability record for the server
@@ -252,6 +253,7 @@ pub async fn link_device<
             "/v1/keepalive/provisioning",
             &[],
             None,
+            csprng,
             clock.clone(),
         )
         .await?;

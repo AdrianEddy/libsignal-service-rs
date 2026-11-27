@@ -897,6 +897,7 @@ fn sent_by_primary(
             "/v1/keepalive",
             &[],
             Some(common::credentials()),
+            &mut rand::rng(),
             Rc::new(ManualClock::default()),
         ))
         .unwrap();

@@ -73,6 +73,7 @@ fn socket(
             "/v1/keepalive",
             &[],
             Some(credentials()),
+            &mut rand::rng(),
             clock,
         ))
         .unwrap();

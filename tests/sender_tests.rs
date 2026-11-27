@@ -114,6 +114,7 @@ fn sent_transcript_free_fn_equals_method_output() {
             "/v1/keepalive",
             &[],
             Some(credentials()),
+            &mut rand::rng(),
             clock.clone(),
         ))
         .unwrap();
@@ -124,6 +125,7 @@ fn sent_transcript_free_fn_equals_method_output() {
             "/v1/keepalive",
             &[],
             None,
+            &mut rand::rng(),
             clock.clone(),
         ))
         .unwrap();
@@ -653,6 +655,7 @@ fn unidentified_socket(
             "/v1/keepalive",
             &[],
             None,
+            &mut rand::rng(),
             Rc::new(ManualClock::default()),
         ))
         .unwrap();
@@ -781,6 +784,7 @@ fn a_challenged_send_names_the_wait() {
                 "/v1/keepalive",
                 &[],
                 Some(credentials()),
+                &mut rand::rng(),
                 clock.clone(),
             ))
             .unwrap();
@@ -791,6 +795,7 @@ fn a_challenged_send_names_the_wait() {
                 "/v1/keepalive",
                 &[],
                 None,
+                &mut rand::rng(),
                 clock.clone(),
             ))
             .unwrap();

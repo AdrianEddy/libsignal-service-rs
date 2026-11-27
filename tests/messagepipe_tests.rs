@@ -47,6 +47,7 @@ impl Socket {
             .run_until(MessageReceiver::new(service).create_message_pipe(
                 credentials(),
                 false,
+                &mut rand::rng(),
                 clock.clone(),
             ))
             .unwrap();

@@ -28,6 +28,7 @@ fn capabilities_go_as_the_map_signal_server_reads() {
             "/v1/keepalive",
             &[],
             Some(credentials()),
+            &mut rand::rng(),
             Rc::new(ManualClock::default()),
         ))
         .unwrap();

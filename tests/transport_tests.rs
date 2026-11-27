@@ -449,6 +449,7 @@ async fn errors_carry_no_reqwest_type() {
             "/v1/keepalive",
             &[],
             Some(credentials()),
+            &mut rand::rng(),
             Rc::new(ManualClock::default()),
         )
         .await
@@ -582,6 +583,7 @@ async fn invalid_header_fails_without_a_request() {
             "/v1/keepalive",
             &[("X-Signal-Agent", "line\nbreak")],
             None,
+            &mut rand::rng(),
             Rc::new(ManualClock::default()),
         )
         .await
@@ -651,6 +653,7 @@ async fn credentials_without_a_phone_number_log_in_as_the_aci() {
                 "/v1/keepalive",
                 &[],
                 Some(cannot_log_in),
+                &mut rand::rng(),
                 Rc::new(ManualClock::default()),
             )
             .await
@@ -704,6 +707,7 @@ fn websocket_keepalive_and_responses() {
         .run_until(MessageReceiver::new(service).create_message_pipe(
             credentials(),
             true,
+            &mut rand::rng(),
             clock.clone(),
         ))
         .unwrap();
@@ -869,6 +873,7 @@ fn socket_task_is_returned_not_spawned() {
                 "/v1/keepalive/provisioning",
                 &[],
                 None,
+                &mut rand::rng(),
                 clock.clone(),
             )
             .await
@@ -924,6 +929,7 @@ fn dropping_the_task_closes_the_socket() {
             "/v1/keepalive",
             &[],
             Some(credentials()),
+            &mut rand::rng(),
             Rc::new(ManualClock::default()),
         ))
         .unwrap();
@@ -985,6 +991,7 @@ fn the_connection_ending_ends_the_task() {
                 "/v1/keepalive",
                 &[],
                 Some(credentials()),
+                &mut rand::rng(),
                 Rc::new(ManualClock::default()),
             ))
             .unwrap();
@@ -1024,6 +1031,7 @@ fn a_keepalive_that_cannot_be_sent_fails_the_task() {
             "/v1/keepalive",
             &[],
             Some(credentials()),
+            &mut rand::rng(),
             clock.clone(),
         ))
         .unwrap();
