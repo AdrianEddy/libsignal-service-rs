@@ -401,7 +401,7 @@ fn a_provisioning_envelope_that_cant_be_opened_is_an_error() {
         .unwrap();
     let cipher = ProvisioningCipher::from_key_pair(device);
     assert_eq!(
-        cipher.decrypt(sealed.clone()).unwrap(),
+        cipher.decrypt(sealed.clone()).unwrap().message,
         ProvisionMessage::default()
     );
     let body = sealed.body.clone().unwrap();

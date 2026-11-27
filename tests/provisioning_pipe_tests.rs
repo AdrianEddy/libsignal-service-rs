@@ -1,30 +1,42 @@
 //! The provisioning pipe's steps: each comes out of the poll that takes its
-//! request from the socket, and the primary's message reaches the caller
-//! whether or not its answer still reaches the server.
+//! request from the socket, the primary's message reaches the caller whether
+//! or not its answer still reaches the server, and it comes with its
+//! plaintext, which holds the fields this crate's protos lack.
 
 mod common;
 
 use std::{pin::Pin, rc::Rc};
 
+use aes::{
+    cipher::{
+        block_padding::Pkcs7,
+        consts::{U32, U64},
+        Array, BlockModeEncrypt as _, KeyIvInit as _,
+    },
+    Aes256,
+};
 use futures::{
     executor::LocalPool,
     future::{FutureExt as _, RemoteHandle},
     task::LocalSpawnExt as _,
     Stream, StreamExt as _,
 };
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use libsignal_service::{
     prelude::ProtobufMessage as _,
     proto::ProvisioningAddress,
-    protocol::PublicKey,
+    protocol::{KeyPair, PublicKey},
     provisioning::{
-        ProvisionMessage, ProvisioningCipher, ProvisioningError,
-        ProvisioningPipe, ProvisioningStep,
+        ProvisionEnvelope, ProvisionMessage, ProvisioningCipher,
+        ProvisioningError, ProvisioningPipe, ProvisioningStep,
     },
     push_service::ServiceError,
     transport::WsEvent,
     utils::BASE64_RELAXED,
     websocket::{SocketEnd, Unidentified},
 };
+use rand::Rng as _;
+use sha2::Sha256;
 
 use common::*;
 
@@ -122,6 +134,36 @@ fn sealed_for(key: PublicKey) -> (ProvisionMessage, Vec<u8>) {
     (message, envelope.encode_to_vec())
 }
 
+/// `plaintext` sealed for `key` as a primary seals its message's encoding
+/// (as [`ProvisioningCipher::encrypt`] does): what a primary whose
+/// `Provisioning.proto` names a field this crate's lacks sends.
+fn seal(key: PublicKey, plaintext: &[u8]) -> ProvisionEnvelope {
+    const VERSION: u8 = 1;
+    let mut rng = rand::rng();
+    let ours = KeyPair::generate(&mut rng);
+    let agreement = ours.calculate_agreement(&key).unwrap();
+    let mut secrets = Array::<u8, U64>::default();
+    hkdf::Hkdf::<Sha256>::new(None, &agreement)
+        .expand(b"TextSecure Provisioning Message", &mut secrets)
+        .unwrap();
+    let (aes_key, mac_key) = secrets.split_ref::<U32>();
+    let iv: [u8; 16] = rng.random();
+    let ciphertext = cbc::Encryptor::<Aes256>::new(aes_key, &iv.into())
+        .encrypt_padded_vec::<Pkcs7>(plaintext);
+    let mut mac = Hmac::<Sha256>::new_from_slice(mac_key).unwrap();
+    mac.update(&[VERSION]);
+    mac.update(&iv);
+    mac.update(&ciphertext);
+    let mut body = vec![VERSION];
+    body.extend_from_slice(&iv);
+    body.extend_from_slice(&ciphertext);
+    body.extend_from_slice(&mac.finalize().into_bytes());
+    ProvisionEnvelope {
+        public_key: Some(ours.public_key.serialize().into()),
+        body: Some(body),
+    }
+}
+
 /// A request the socket holds is a step at the first poll that follows: the
 /// address, then the primary's message, each answered as it is handed over.
 #[test]
@@ -132,7 +174,9 @@ fn a_buffered_step_is_yielded_by_one_poll() {
 
     let (message, envelope) = sealed_for(key);
     pipe.server.request(2, "PUT", "/v1/message", envelope);
-    let Some(Some(Ok(ProvisioningStep::Message(opened)))) = pipe.poll_once()
+    let Some(Some(Ok(ProvisioningStep::Message {
+        message: opened, ..
+    }))) = pipe.poll_once()
     else {
         panic!("the message, at the first poll")
     };
@@ -166,7 +210,9 @@ fn a_message_whose_socket_ended_before_its_answer_is_yielded() {
         }
     );
 
-    let Some(Some(Ok(ProvisioningStep::Message(opened)))) = pipe.poll_once()
+    let Some(Some(Ok(ProvisioningStep::Message {
+        message: opened, ..
+    }))) = pipe.poll_once()
     else {
         panic!("the message, though its answer can't go")
     };
@@ -197,4 +243,41 @@ fn an_address_whose_socket_ended_is_ws_closing() {
         "the address of a closed socket"
     );
     assert!(matches!(pipe.poll_once(), Some(None)));
+}
+
+/// Field 99, a string: a field this crate's `Provisioning.proto` doesn't
+/// name, as a newer primary's would be. Its key is (99 << 3) | 2, a two-byte
+/// varint.
+const FIELD_99: [u8; 8] = [0x9a, 0x06, 5, b'n', b'e', b'w', b'e', b'r'];
+
+/// A field this crate's `Provisioning.proto` lacks is in the step's
+/// plaintext, the message as the primary encoded it, and not in its
+/// decoding.
+#[test]
+fn a_field_the_proto_lacks_is_in_the_plaintext_alone() {
+    let mut pipe = Pipe::open();
+    let key = pipe.address();
+    let message = ProvisionMessage {
+        provisioning_code: Some("code".into()),
+        aci_identity_key_private: Some(vec![7; 32]),
+        ..Default::default()
+    };
+    let mut sent = message.encode_to_vec();
+    sent.extend_from_slice(&FIELD_99);
+    let envelope = seal(key, &sent).encode_to_vec();
+    pipe.server.request(2, "PUT", "/v1/message", envelope);
+    let Some(Some(Ok(ProvisioningStep::Message {
+        message: opened,
+        plaintext,
+    }))) = pipe.poll_once()
+    else {
+        panic!("the message")
+    };
+    assert_eq!(plaintext, sent, "the plaintext holds field 99");
+    assert_eq!(opened, message, "the decoding doesn't");
+    assert_eq!(
+        opened.encode_to_vec().len() + FIELD_99.len(),
+        plaintext.len()
+    );
+    assert_eq!(pipe.answers(), [(1, 200), (2, 200)]);
 }

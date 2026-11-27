@@ -1,4 +1,5 @@
 use base64::Engine;
+use bytes::Bytes;
 use futures::{channel::oneshot, prelude::*};
 use libsignal_protocol::KeyPair;
 use rand::{CryptoRng, Rng};
@@ -15,7 +16,7 @@ use crate::{
     websocket::{self, SignalWebSocket},
 };
 
-use super::cipher::ProvisioningCipher;
+use super::cipher::{DecryptedProvisionMessage, ProvisioningCipher};
 
 /// A new device's end of the provisioning socket: it turns the server's
 /// requests into the link to show and the primary device's provisioning
@@ -27,13 +28,24 @@ pub struct ProvisioningPipe {
     capabilities: String,
 }
 
+/// A step of the link. Its `Debug` prints no byte of the primary's message,
+/// which holds the account's keys: neither the message's fields nor its
+/// plaintext, only the plaintext's length.
 #[expect(clippy::large_enum_variant)]
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 pub enum ProvisioningStep {
     Url(Url),
     /// The primary device's message, raw:
     /// [`ProvisionedAccount`](super::ProvisionedAccount) reads and checks it.
-    Message(ProvisionMessage),
+    Message {
+        /// The message, decoded with this crate's `Provisioning.proto`.
+        message: ProvisionMessage,
+        /// The message as the primary encoded it, decrypted: the fields this
+        /// crate's `Provisioning.proto` lacks included, which `message`
+        /// leaves out.
+        #[debug("{} bytes", plaintext.len())]
+        plaintext: Bytes,
+    },
 }
 
 impl ProvisioningPipe {
@@ -137,7 +149,7 @@ impl ProvisioningPipe {
                     prost::Message::decode(
                         body.ok_or(ProvisioningError::MissingMessage)?,
                     )?;
-                let provision_message =
+                let DecryptedProvisionMessage { message, plaintext } =
                     self.provisioning_cipher.decrypt(provision_envelope)?;
 
                 // The message goes to the caller whether or not its answer
@@ -153,7 +165,7 @@ impl ProvisioningPipe {
                     );
                 }
 
-                Ok(ProvisioningStep::Message(provision_message))
+                Ok(ProvisioningStep::Message { message, plaintext })
             },
             _ => Err(ProvisioningError::WsError {
                 reason: "Incorrect request".into(),

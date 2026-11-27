@@ -6,6 +6,7 @@ mod common;
 use std::{collections::BTreeMap, rc::Rc, time::SystemTime};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::{
     channel::mpsc, executor::LocalPool, future::FutureExt as _,
     task::LocalSpawnExt as _, StreamExt as _,
@@ -25,10 +26,10 @@ use libsignal_service::{
         SignalProtocolError, SignedPreKeyId, SignedPreKeyStore, Timestamp,
     },
     provisioning::{
-        link_device, NewDeviceRegistration, ProvisionEnvelope,
-        ProvisionMessage, ProvisionedAccount, ProvisioningCipher,
-        ProvisioningError, ProvisioningSecrets, ProvisioningStep,
-        SecondaryDeviceProvisioning,
+        link_device, DecryptedProvisionMessage, NewDeviceRegistration,
+        ProvisionEnvelope, ProvisionMessage, ProvisionedAccount,
+        ProvisioningCipher, ProvisioningError, ProvisioningSecrets,
+        ProvisioningStep, SecondaryDeviceProvisioning,
     },
     push_service::{linking::LinkResponse, ServiceError},
     utils::BASE64_RELAXED,
@@ -201,10 +202,14 @@ fn auth_credential_salt_parsed() {
     let envelope = ProvisioningCipher::from_public(device.public_key)
         .encrypt(&mut rng, message)
         .unwrap();
-    let opened = ProvisioningCipher::from_key_pair(device)
+    let DecryptedProvisionMessage {
+        message: opened,
+        plaintext,
+    } = ProvisioningCipher::from_key_pair(device)
         .decrypt(envelope)
         .unwrap();
     assert_eq!(opened.auth_credential_salt.as_deref(), Some(&SALT[..]));
+    assert_eq!(plaintext, wire, "the plaintext is the message's encoding");
 }
 
 /// What a primary device knows of the account it links.
@@ -868,7 +873,8 @@ fn provisioned_account_debug_prints_no_secret() {
 }
 
 /// The message holds the account's private keys, so it prints no field, and
-/// neither does the step that hands it over.
+/// neither the envelope the cipher opened nor the step that hands it over
+/// prints its fields or a byte of its plaintext, only the plaintext's length.
 #[test]
 fn a_provision_message_prints_no_field() {
     let message = ProvisionMessage {
@@ -876,9 +882,18 @@ fn a_provision_message_prints_no_field() {
         ..Default::default()
     };
     assert_eq!(format!("{message:?}"), "ProvisionMessage { .. }");
+    let plaintext = Bytes::from(message.encode_to_vec());
+    assert_eq!(plaintext.len(), 34);
+    let opened = DecryptedProvisionMessage { message, plaintext };
     assert_eq!(
-        format!("{:?}", ProvisioningStep::Message(message)),
-        "Message(ProvisionMessage { .. })"
+        format!("{opened:?}"),
+        "DecryptedProvisionMessage { message: ProvisionMessage { .. }, \
+         plaintext: 34 bytes }"
+    );
+    let DecryptedProvisionMessage { message, plaintext } = opened;
+    assert_eq!(
+        format!("{:?}", ProvisioningStep::Message { message, plaintext }),
+        "Message { message: ProvisionMessage { .. }, plaintext: 34 bytes }"
     );
 }
 
@@ -954,6 +969,7 @@ fn sent_by_primary(
     ProvisioningCipher::from_key_pair(device)
         .decrypt(ProvisionEnvelope::decode(&envelope[..]).unwrap())
         .unwrap()
+        .message
 }
 
 /// A primary without a phone number sends what a new device needs of such an

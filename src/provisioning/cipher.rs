@@ -50,6 +50,21 @@ const VERSION: u8 = 1;
 /// An HMAC-SHA256.
 const MAC_LENGTH: usize = 32;
 
+/// A primary device's envelope, opened by [`ProvisioningCipher::decrypt`].
+/// Its `Debug` prints no byte of the message, which holds the account's keys:
+/// neither the message's fields nor its plaintext, only the plaintext's
+/// length.
+#[derive(derive_more::Debug)]
+pub struct DecryptedProvisionMessage {
+    /// The message, decoded with this crate's `Provisioning.proto`.
+    pub message: ProvisionMessage,
+    /// The message as the primary encoded it, decrypted: the fields this
+    /// crate's `Provisioning.proto` lacks included, which `message` leaves
+    /// out.
+    #[debug("{} bytes", plaintext.len())]
+    pub plaintext: Bytes,
+}
+
 #[derive(Debug)]
 pub struct ProvisioningCipher {
     key_material: CipherMode,
@@ -113,10 +128,14 @@ impl ProvisioningCipher {
         })
     }
 
+    /// Opens a primary device's envelope: its message, decoded, and the
+    /// plaintext it was decoded from, the message as the primary encoded it.
+    /// A field this crate's `Provisioning.proto` lacks is in the plaintext
+    /// alone: the decoding keeps no field it doesn't know.
     pub fn decrypt(
         &self,
         provision_envelope: ProvisionEnvelope,
-    ) -> Result<ProvisionMessage, ProvisioningError> {
+    ) -> Result<DecryptedProvisionMessage, ProvisioningError> {
         let key_pair = match self.key_material {
             CipherMode::DecryptAndEncrypt(ref key_pair) => key_pair,
             CipherMode::EncryptOnly(_) => {
@@ -173,11 +192,16 @@ impl ProvisioningCipher {
         // but that should not matter.
         // https://crypto.stackexchange.com/questions/9043/what-is-the-difference-between-pkcs5-padding-and-pkcs7-padding
         let cipher = cbc::Decryptor::<Aes256>::new(parts1, iv.into());
-        let input = cipher
-            .decrypt_padded_vec::<Pkcs7>(cipher_text)
-            .map_err(ProvisioningError::AesPaddingError)?;
+        let plaintext = Bytes::from(
+            cipher
+                .decrypt_padded_vec::<Pkcs7>(cipher_text)
+                .map_err(ProvisioningError::AesPaddingError)?,
+        );
 
-        Ok(prost::Message::decode(Bytes::from(input))?)
+        // From the `Bytes` (its clone is a reference count) prost copies each
+        // `bytes` field once; from a slice it would copy each twice.
+        let message = ProvisionMessage::decode(plaintext.clone())?;
+        Ok(DecryptedProvisionMessage { message, plaintext })
     }
 }
 
@@ -207,8 +231,12 @@ mod tests {
             Err(ProvisioningError::EncryptOnlyProvisioningCipher)
         ));
 
-        let decrypted = cipher.decrypt(encrypted)?;
+        let DecryptedProvisionMessage {
+            message: decrypted,
+            plaintext,
+        } = cipher.decrypt(encrypted)?;
         assert_eq!(msg, decrypted);
+        assert_eq!(plaintext, msg.encode_to_vec());
 
         Ok(())
     }

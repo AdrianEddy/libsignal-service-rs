@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use libsignal_account_keys::{AccountEntropyPool, InvalidAccountEntropyPool};
 
-pub use cipher::ProvisioningCipher;
+pub use cipher::{DecryptedProvisionMessage, ProvisioningCipher};
 
 use base64::Engine;
 use futures::future::{self, Either};
@@ -329,12 +329,14 @@ async fn link_steps<
         return Err(ProvisioningError::InvalidStep);
     }
 
-    if let ProvisioningStep::Message(message) =
-        provision_stream
-            .next()
-            .await
-            .ok_or(ProvisioningError::MissingMessage)??
+    if let ProvisioningStep::Message { message, plaintext } = provision_stream
+        .next()
+        .await
+        .ok_or(ProvisioningError::MissingMessage)??
     {
+        // The link reads the decoding alone: the plaintext, which holds the
+        // account's keys, goes now, not with the scrutinee after the link.
+        drop(plaintext);
         let account = ProvisionedAccount::try_from(message)?;
 
         let (
@@ -495,10 +497,11 @@ pub struct PhoneNumberIdentity {
 }
 
 /// The account a primary device's [`ProvisionMessage`] describes, read and
-/// checked. [`ProvisioningStep::Message`] hands the message over raw: a client
-/// that drives the link's steps itself reads it with this `TryFrom`, before it
-/// makes any prekey, and passes the server's answer to
-/// [`check_link_response`](Self::check_link_response), as [`link_device`] does.
+/// checked. [`ProvisioningStep::Message`] hands the message over raw, with its
+/// plaintext: a client that drives the link's steps itself reads the message
+/// with this `TryFrom`, before it makes any prekey, and passes the server's
+/// answer to [`check_link_response`](Self::check_link_response), as
+/// [`link_device`] does.
 ///
 /// An account without a phone number is one whose message has no PNI: it has
 /// no phone number or PNI identity, a PNI private key in such a message is
