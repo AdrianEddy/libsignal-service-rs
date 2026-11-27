@@ -593,12 +593,8 @@ impl<C: WebSocketType> SignalWebSocket<C> {
         self.inner.stream.borrow_mut().take()
     }
 
-    pub(crate) fn return_request_stream(&mut self, r: SignalRequestStream) {
-        self.inner.stream.borrow_mut().replace(r);
-    }
-
     // XXX Ideally, this should take an *async* closure, then we could get rid of the
-    // `take_request_stream` and `return_request_stream`.
+    // `take_request_stream`.
     pub async fn with_request_stream<
         R: 'static,
         F: FnOnce(&mut SignalRequestStream) -> R,

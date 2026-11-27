@@ -14,7 +14,7 @@ pub use cipher::ProvisioningCipher;
 use base64::Engine;
 use futures::future::{self, Either};
 use futures::StreamExt;
-use futures::{channel::mpsc::Sender, pin_mut, SinkExt};
+use futures::{channel::mpsc::Sender, SinkExt};
 use libsignal_core::curve::CurveError;
 use libsignal_core::E164;
 use libsignal_protocol::{
@@ -315,8 +315,7 @@ async fn link_steps<
 
     let provisioning_pipe =
         ProvisioningPipe::from_socket(ws, csprng, link_capabilities);
-    let provision_stream = provisioning_pipe.stream();
-    pin_mut!(provision_stream);
+    let mut provision_stream = provisioning_pipe.stream();
 
     if let ProvisioningStep::Url(url) = provision_stream
         .next()

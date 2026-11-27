@@ -1,11 +1,5 @@
 use base64::Engine;
-use futures::{
-    channel::{
-        mpsc::{self, Sender},
-        oneshot,
-    },
-    prelude::*,
-};
+use futures::{channel::oneshot, prelude::*};
 use libsignal_protocol::KeyPair;
 use rand::{CryptoRng, Rng};
 use url::Url;
@@ -65,31 +59,13 @@ impl ProvisioningPipe {
         }
     }
 
-    /// Worker task that
-    async fn run(
-        mut self,
-        mut sink: Sender<Result<ProvisioningStep, ProvisioningError>>,
-    ) -> Result<(), mpsc::SendError> {
-        let mut ws = self.ws.clone();
-        let mut stream = ws
-            .take_request_stream()
-            .expect("web socket request handler not in use");
-        while let Some((req, responder)) = stream.next().await {
-            let env = self.process_request(req, responder).await.transpose();
-            if let Some(env) = env {
-                sink.send(env).await?;
-            }
-        }
-        ws.return_request_stream(stream);
-
-        Ok(())
-    }
-
-    async fn process_request(
-        &mut self,
+    /// The step one of the server's requests makes: the link to show, once
+    /// its address is answered, or the primary device's message.
+    fn process_request(
+        &self,
         request: WebSocketRequestMessage,
         responder: oneshot::Sender<WebSocketResponseMessage>,
-    ) -> Result<Option<ProvisioningStep>, ProvisioningError> {
+    ) -> Result<ProvisioningStep, ProvisioningError> {
         let ok = WebSocketResponseMessage {
             id: request.id,
             status: Some(200),
@@ -136,12 +112,13 @@ impl ProvisioningPipe {
                         .append_pair("capabilities", &self.capabilities);
                 }
 
-                // acknowledge
+                // acknowledge: a link whose address can't be answered any more
+                // is of a socket that ended, which links nothing.
                 responder
                     .send(ok)
                     .map_err(|_| ProvisioningError::WsClosing)?;
 
-                Ok(Some(ProvisioningStep::Url(provisioning_url)))
+                Ok(ProvisioningStep::Url(provisioning_url))
             },
             // step 2: once the QR code is scanned by the (already
             // validated) main device
@@ -163,12 +140,20 @@ impl ProvisioningPipe {
                 let provision_message =
                     self.provisioning_cipher.decrypt(provision_envelope)?;
 
-                // acknowledge
-                responder
-                    .send(ok)
-                    .map_err(|_| ProvisioningError::WsClosing)?;
+                // The message goes to the caller whether or not its answer
+                // still reaches the server: the link it carries goes over
+                // HTTP. The answer goes to the socket's task, which writes it
+                // once the message is handed over; a socket that ended takes
+                // none (Signal-Desktop decrypts and hands the message on
+                // before it answers, `Provisioner.preload.ts`).
+                if responder.send(ok).is_err() {
+                    tracing::debug!(
+                        "the provisioning socket ended before its message \
+                         was answered"
+                    );
+                }
 
-                Ok(Some(ProvisioningStep::Message(provision_message)))
+                Ok(ProvisioningStep::Message(provision_message))
             },
             _ => Err(ProvisioningError::WsError {
                 reason: "Incorrect request".into(),
@@ -176,18 +161,21 @@ impl ProvisioningPipe {
         }
     }
 
+    /// The steps the server's requests make, in order: each comes out of the
+    /// poll that takes its request from the socket, so a request the socket
+    /// already holds is a step at once. A request that makes no step is an
+    /// error, and the steps go on; they end with the socket. The pipe holds
+    /// its socket open while the stream lives.
     pub fn stream(
-        self,
-    ) -> impl Stream<Item = Result<ProvisioningStep, ProvisioningError>> {
-        let (sink, stream) = mpsc::channel(1);
-
-        let stream = stream.map(Some);
-        let runner = self.run(sink).map(|_| {
-            tracing::info!("Sink closed, provisioning is done!");
-            None
-        });
-
-        let combined = futures::stream::select(stream, runner.into_stream());
-        combined.filter_map(|x| async { x })
+        mut self,
+    ) -> impl Stream<Item = Result<ProvisioningStep, ProvisioningError>> + Unpin
+    {
+        let requests = self
+            .ws
+            .take_request_stream()
+            .expect("web socket request handler not in use");
+        requests.map(move |(request, responder)| {
+            self.process_request(request, responder)
+        })
     }
 }
